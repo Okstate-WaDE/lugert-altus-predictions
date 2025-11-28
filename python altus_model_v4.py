@@ -296,7 +296,6 @@ df_daily['hr_thresh_p90'] = df_daily['month'].apply(lambda m: 1.5)
 df_daily['is_heavy_p90'] = (df_daily['rain_total'] >= df_daily['hr_thresh_p90']).astype(float)
 df_daily['heavy_rain_days_30d'] = df_daily['is_heavy_p90'].rolling(ROLL_30, min_periods=1).sum()
 
-
 daily_snap = (
     df_daily.set_index('date_day')
             .resample('ME')   # changed from 'M' -> 'ME' per FutureWarning
@@ -385,10 +384,6 @@ monthly_df['rain_bsn_roll12'] = monthly_df['rainfall'].shift(1).rolling(window=1
 #monthly_df['rain_dam_next'] = monthly_df[COL_RAIN_DAM].shift(-1)
 #monthly_df['rainfall_next'] = monthly_df['rainfall_total'].shift(-1)
 
-# -------------------------------------------
-# Monthly rainfall "forecast" for next month
-# (climatological mean by calendar month)
-# -------------------------------------------
 
 # 1. Build climatology dictionaries from ALL years
 bsn_clim = monthly_df.groupby(COL_MONTH)[COL_RAIN_BSN].mean().to_dict()
@@ -442,7 +437,7 @@ data = monthly_df[['date', COL_YEAR, COL_MONTH] + FEATURES + [TARGET_RAW, TARGET
 # ---------------- Fixed TIME SPLIT ----------------
 # optionally exclude specific year(s) from the training set
 # set to [] to include all years, or e.g. [2010] to remove 2010 from training
-EXCLUDE_YEARS = [1995]
+EXCLUDE_YEARS = []
 
 train_mask = (data[COL_YEAR] <= TRAIN_END) & (~data[COL_YEAR].isin(EXCLUDE_YEARS))
 train = data[train_mask]
@@ -636,32 +631,6 @@ for name, col in name_to_col.items():
         # label by model name (e.g., 'XGBoost', 'Ridge', 'Linear', 'RandomForest')
         series[name] = test_out[col].values
 
-# Highlight best test model (lowest MAE) and plot its CI if available
-best_model_name = None
-try:
-    best_row = metrics_df[metrics_df['split'] == 'test'].sort_values('MAE').iloc[0]
-    best_model_name = best_row['name']
-except Exception:
-    best_model_name = None
-
-if best_model_name is not None:
-    best_col = name_to_col.get(best_model_name)
-    if best_col in test_out.columns:
-        # add explicit "Best: <name>" series for emphasis
-        series[f'Best: {best_model_name}'] = test_out[best_col].values
-        # plot CI bands for best model if CI columns exist
-        lo90, hi90 = f'{best_col}_lo90', f'{best_col}_hi90'
-        lo50, hi50 = f'{best_col}_lo50', f'{best_col}_hi50'
-        if lo90 in test_out.columns and hi90 in test_out.columns:
-            plot_with_ci_band(test_out, actual_col='y_true', pred_col=best_col,
-                              lo_col=lo90, hi_col=hi90,
-                              title=f'{best_model_name} Prediction with 90% CI',
-                              fname=f'test_timeline_{best_model_name.lower()}_ci_90.png', out_dir=OUT_DIR)
-        if lo50 in test_out.columns and hi50 in test_out.columns:
-            plot_with_ci_band(test_out, actual_col='y_true', pred_col=best_col,
-                              lo_col=lo50, hi_col=hi50,
-                              title=f'{best_model_name} Prediction with 50% CI',
-                              fname=f'test_timeline_{best_model_name.lower()}_ci_50.png', out_dir=OUT_DIR)
 
 # Final timeline plot with whatever series we have (ensures XGBoost appears if it was best/was run)
 plot_test_timeline(test_out, series, OUT_DIR, fname="test_timeline_fixed.png", title="Test (fixed split)")
@@ -675,29 +644,10 @@ print(" - predictions_test_fixed.csv")
 print(" - rain_pdf_MM_MON.png (12 files)")
 print(" - test_timeline_fixed.png")
 
-# ---------------- SCATTER PLOTS ----------------
-y_true_test = test_out['y_true'].values
-y_pred_linear = test_out['y_lin'].values
-
-plt.figure(figsize=(6,6))
-plt.scatter(y_true_test, y_pred_linear, alpha=0.7)
-plt.xlabel("Actual Inflow"); plt.ylabel("Predicted Inflow (Linear)")
-plt.title("Actual vs Predicted Inflow (Linear)")
-mx = max(np.nanmax(y_true_test), np.nanmax(y_pred_linear))
-plt.plot([0, mx], [0, mx], color='k', linestyle='--')
-plt.tight_layout()
-
-outfile = OUT_DIR / "scatter_actual_vs_pred_linear.png"
-plt.savefig(outfile, dpi=150)
-plt.close()
-print(f"Saved: {outfile}")
 
 
 
-
-# ============================================================
 # DAILY → NEXT-30-DAY INFLOW MODEL (rolling-window features)
-# ============================================================
 
 print("\n===== DAILY NEXT-30-DAY INFLOW MODEL =====")
 
