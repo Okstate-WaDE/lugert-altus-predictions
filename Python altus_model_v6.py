@@ -12,19 +12,19 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 
 from math import sqrt
 
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 
 # Optional models
 RF_AVAILABLE = False
 XGB_AVAILABLE = False
 try:
-    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
     RF_AVAILABLE = True
 except Exception:
     pass
@@ -41,9 +41,16 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SUBBASIN_RAIN_PATH = Path(r"C:\Users\aalec\OneDrive - Oklahoma A and M System\Desktop\Altus Project\ERA5Land_daily_area_weighted_subbasin_rainfall.csv")
 SUBBASIN_SM_PATH = Path(r"C:\Users\aalec\OneDrive - Oklahoma A and M System\Desktop\Altus Project\ERA5Land_daily_area_weighted_subbasin_soil_moisture.csv")
+SUBBASIN_AREA_TOLERANCE_PCT = 2.0
+CANONICAL_SUBBASINS = [
+    {'subbasin_id': 'SB_SW', 'representative_area_m2': 878470000.0,  'reference_lon': -100.2800817, 'reference_lat': 35.3272738},
+    {'subbasin_id': 'SB_M',  'representative_area_m2': 937450000.0,  'reference_lon':  -99.8063283, 'reference_lat': 35.3290272},
+    {'subbasin_id': 'SB_SE', 'representative_area_m2': 1064410000.0, 'reference_lon':  -99.5099193, 'reference_lat': 35.1724732},
+    {'subbasin_id': 'SB_NW', 'representative_area_m2': 1405090000.0, 'reference_lon': -100.1718715, 'reference_lat': 35.4996085},
+]
 # Fixed split years
 TRAIN_END = 2018 # inclusive
-VAL_END   = 2023  # inclusive; test is > VAL_END
+VAL_END   = 2024  # inclusive; test is > VAL_END
 
 # Flood-robustness controls
 FLOOD_QUANTILE = 0.90
@@ -59,8 +66,6 @@ ISSUE_DAY_OF_MONTH = 1
 # Exact CSV headers
 COL_DAY         = 'day'
 COL_INFLOW      = 'inflow adj'
-COL_RAIN_DAM    = 'rainfall inches (7A to Dam)'
-COL_RAIN_BSN    = 'rainfall inches (7A to BSN)'
 COL_MONTH       = 'month'
 COL_YEAR        = 'year'
 
@@ -71,13 +76,7 @@ def extra_metrics(y_true, y_pred):
     mae  = mean_absolute_error(y_true, y_pred)
     rmse = sqrt(mean_squared_error(y_true, y_pred))
     r2   = r2_score(y_true, y_pred)
-
-    # Nash-Sutcliffe Efficiency
-    sse = float(np.sum((y_true - y_pred) ** 2))
-    denom = float(np.sum((y_true - np.mean(y_true)) ** 2))
-    nse = np.nan if denom <= 0 else 1.0 - (sse / denom)
-
-    return {"MAE": mae, "RMSE": rmse, "R2": r2, "NSE": nse}
+    return {"MAE": mae, "RMSE": rmse, "R2": r2}
 
 def flood_focus_metrics(y_true, y_pred, flood_threshold=None, event_threshold=None):
     y_true = np.asarray(y_true, dtype=float)
@@ -243,37 +242,123 @@ def build_area_subbasin_features(rain_path: Path, sm_path: Path):
     rain_df['rain_mm_aw'] = pd.to_numeric(rain_df['rain_mm_aw'], errors='coerce')
     sm_df['sm_aw'] = pd.to_numeric(sm_df['sm_aw'], errors='coerce')
 
-    rain_unique = sorted(pd.Series(rain_df['area_m2_used'].dropna().unique(), dtype=float).tolist())
-    sm_unique = sorted(pd.Series(sm_df['area_m2_used'].dropna().unique(), dtype=float).tolist())
-    common_areas = sorted(set(rain_unique).intersection(set(sm_unique)))
+    def prep_long(df, value_col):
+        return (
+            df[['date_day', 'area_m2_used', value_col]]
+            .dropna(subset=['date_day', 'area_m2_used'])
+            .copy()
+        )
 
-    if common_areas:
-        rain_area_to_sb = {a: f"SB{i+1}" for i, a in enumerate(common_areas)}
-        sm_area_to_sb = rain_area_to_sb.copy()
-        sb_cols = [rain_area_to_sb[a] for a in common_areas]
-        area_weights = pd.Series({rain_area_to_sb[a]: a for a in common_areas}, dtype=float)
-    else:
-        if len(rain_unique) != len(sm_unique):
-            raise ValueError(
-                "No exact overlapping subbasin areas and counts differ between rain and soil files."
-            )
-        rain_area_to_sb = {a: f"SB{i+1}" for i, a in enumerate(rain_unique)}
-        sm_area_to_sb = {a: f"SB{i+1}" for i, a in enumerate(sm_unique)}
-        sb_cols = [f"SB{i+1}" for i in range(len(rain_unique))]
-        area_weights = pd.Series({f"SB{i+1}": a for i, a in enumerate(rain_unique)}, dtype=float)
+    rain_x = prep_long(rain_df, 'rain_mm_aw')
+    sm_x = prep_long(sm_df, 'sm_aw')
 
+    canonical = pd.DataFrame(CANONICAL_SUBBASINS)
+    sb_cols = canonical['subbasin_id'].tolist()
+    validation_rows = []
+
+    def assign_canonical_subbasin(source, x, value_col):
+        area_to_basin = {}
+        for area, g in x.groupby('area_m2_used'):
+            idx = (canonical['representative_area_m2'] - area).abs().idxmin()
+            basin = canonical.loc[idx]
+            diff_pct = float(abs(basin['representative_area_m2'] - area) / area * 100.0)
+            if diff_pct > SUBBASIN_AREA_TOLERANCE_PCT:
+                raise ValueError(
+                    f"Canonical subbasin match for {source} area {area:.6f} "
+                    f"is {diff_pct:.3f}% away, above tolerance "
+                    f"{SUBBASIN_AREA_TOLERANCE_PCT:.3f}%."
+                )
+
+            area_to_basin[float(area)] = basin
+            validation_rows.append({
+                'source': source,
+                'legacy_area_m2_used': float(area),
+                'legacy_row_count': int(len(g)),
+                'legacy_value_non_null_count': int(g[value_col].notna().sum()),
+                'legacy_min_date': g['date_day'].min(),
+                'legacy_max_date': g['date_day'].max(),
+                'canonical_area_m2': float(basin['representative_area_m2']),
+                'subbasin_id': basin['subbasin_id'],
+                'reference_lon': float(basin['reference_lon']),
+                'reference_lat': float(basin['reference_lat']),
+                'area_diff_pct': diff_pct,
+            })
+
+        x['subbasin'] = x['area_m2_used'].map(lambda a: area_to_basin[float(a)]['subbasin_id'])
+        x['subbasin_id'] = x['subbasin']
+        x['centroid_lon'] = x['area_m2_used'].map(lambda a: area_to_basin[float(a)]['reference_lon'])
+        x['centroid_lat'] = x['area_m2_used'].map(lambda a: area_to_basin[float(a)]['reference_lat'])
+
+    assign_canonical_subbasin('rain', rain_x, 'rain_mm_aw')
+    assign_canonical_subbasin('soil_moisture', sm_x, 'sm_aw')
+
+    validation = pd.DataFrame(validation_rows).sort_values(['source', 'legacy_area_m2_used'])
+    validation_path = OUT_DIR / 'subbasin_area_mapping_validation.csv'
+    validation.to_csv(validation_path, index=False)
+    print(f"Saved: {validation_path}")
+    mapping_method = 'canonical_area'
+    print(f"Subbasin mapping method used: {mapping_method}")
+
+    area_weights = canonical.set_index('subbasin_id')['representative_area_m2'].reindex(sb_cols)
+    area_weights = area_weights.astype(float)
     area_weights = area_weights / area_weights.sum()
 
-    rain_x = rain_df[['date_day', 'area_m2_used', 'rain_mm_aw']].dropna(subset=['date_day', 'area_m2_used'])
-    rain_x['subbasin'] = rain_x['area_m2_used'].map(rain_area_to_sb)
+    def write_subbasin_mapping_audit(rain_x, sm_x, mapping_method):
+        audit_frames = []
+        for source, x, value_col in [
+            ('rain', rain_x, 'rain_mm_aw'),
+            ('soil_moisture', sm_x, 'sm_aw'),
+        ]:
+            tmp = x.copy()
+            tmp['source'] = source
+            tmp['value_non_null'] = tmp[value_col].notna()
+            audit_frames.append(tmp)
+
+        audit_long = pd.concat(audit_frames, ignore_index=True)
+        audit_cols = [
+            'source',
+            'subbasin',
+            'subbasin_id',
+            'centroid_lon',
+            'centroid_lat',
+            'area_m2_used',
+        ]
+        audit = (
+            audit_long
+            .groupby(audit_cols, dropna=False)
+            .agg(
+                row_count=('date_day', 'size'),
+                value_non_null_count=('value_non_null', 'sum'),
+                min_date=('date_day', 'min'),
+                max_date=('date_day', 'max'),
+            )
+            .reset_index()
+        )
+        audit.insert(0, 'mapping_method', mapping_method)
+        out_path = OUT_DIR / 'subbasin_mapping_audit.csv'
+        audit.to_csv(out_path, index=False)
+        print(f"Saved: {out_path}")
+
+    write_subbasin_mapping_audit(rain_x, sm_x, mapping_method)
+
+    rain_x = (
+        rain_x
+        .dropna(subset=['subbasin'])
+        .groupby(['date_day', 'subbasin'], as_index=False)['rain_mm_aw']
+        .mean()
+    )
     rain_wide = (
         rain_x.pivot_table(index='date_day', columns='subbasin', values='rain_mm_aw', aggfunc='mean')
         .reindex(columns=sb_cols)
         .sort_index()
     )
 
-    sm_x = sm_df[['date_day', 'area_m2_used', 'sm_aw']].dropna(subset=['date_day', 'area_m2_used'])
-    sm_x['subbasin'] = sm_x['area_m2_used'].map(sm_area_to_sb)
+    sm_x = (
+        sm_x
+        .dropna(subset=['subbasin'])
+        .groupby(['date_day', 'subbasin'], as_index=False)['sm_aw']
+        .mean()
+    )
     sm_wide = (
         sm_x.pivot_table(index='date_day', columns='subbasin', values='sm_aw', aggfunc='mean')
         .reindex(columns=sb_cols)
@@ -324,7 +409,7 @@ month_map = {'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,
 if df[COL_MONTH].dtype == object:
     df[COL_MONTH] = df[COL_MONTH].map(month_map).astype(int)
 
-need = [COL_YEAR, COL_MONTH, COL_DAY, COL_INFLOW, COL_RAIN_DAM, COL_RAIN_BSN]
+need = [COL_YEAR, COL_MONTH, COL_DAY, COL_INFLOW]
 df = df[need].copy().sort_values([COL_YEAR, COL_MONTH, COL_DAY])
 
 # --- Daily dataframe prep (for next-30-day model) ---
@@ -335,12 +420,7 @@ df_daily['date_day'] = pd.to_datetime(
 )
 df_daily = df_daily.dropna(subset=['date_day']).sort_values('date_day')
 
-# Use only Rain 7A to BSN (basin) as the rain feature
-df_daily['rain_total'] = df_daily[COL_RAIN_BSN].astype(float).fillna(0.0)
-df_daily['inflow_day'] = df_daily[COL_INFLOW].astype(float).fillna(0.0)
-df_daily['rain_dam']  = df_daily[COL_RAIN_DAM].astype(float).fillna(0.0)
-
-# DAILY → NEXT-30-DAY INFLOW MODEL (rolling-window features)
+# DAILY -> NEXT-30-DAY INFLOW MODEL (rolling-window features)
 
 print("\n===== DAILY NEXT-30-DAY INFLOW MODEL =====")
 
@@ -350,7 +430,6 @@ daily = df_daily.copy().sort_values('date_day').reset_index(drop=True)
 # plot daily inflow time series (raw + 30-day running sum) and save to OUT_DIR
 daily['date_day'] = pd.to_datetime(daily['date_day'])
 daily['inflow_raw_plot'] = pd.to_numeric(daily[COL_INFLOW], errors='coerce').fillna(0.0)
-daily['inflow_30d_sum'] = daily['inflow_raw_plot'].rolling(30, min_periods=1).sum()
 
 plt.figure(figsize=(12,5))
 ax = plt.gca()
@@ -373,10 +452,8 @@ l1, = ax.plot(daily['date_day'], daily['inflow_raw_plot'], color='tab:red', alph
 ax.axvline(boundary_train_to_val, color='tab:green', linestyle='--', linewidth=1.0)
 ax.axvline(boundary_val_to_test,  color='tab:orange', linestyle='--', linewidth=1.0)
 
-# build legend combining lines and shaded region labels
-from matplotlib.patches import Patch
 patch_train = Patch(facecolor='tab:green', alpha=0.10, label=f'Train (<= {TRAIN_END})')
-patch_val   = Patch(facecolor='tab:orange', alpha=0.10, label=f'Val ({TRAIN_END+1}–{VAL_END})')
+patch_val   = Patch(facecolor='tab:orange', alpha=0.10, label=f'Val ({TRAIN_END+1}-{VAL_END})')
 patch_test  = Patch(facecolor='tab:blue', alpha=0.08, label=f'Test (>= {VAL_END+1})')
 
 ax.set_xlabel('Date'); ax.set_ylabel('Inflow'); ax.set_title('Daily inflow time series')
@@ -413,38 +490,9 @@ daily = daily.merge(sub_feats, on='date_day', how='left')
 print(f"Added area-specific features from {len(subbasins_found)} subbasins: {subbasins_found}")
 
 
-# 3. Rolling-window features (rain, inflow, soil moisture, storage)
-
-# Base series
-rain = daily['rain_total'].astype(float).fillna(0.0)
-dam = daily['rain_dam'].astype(float).fillna(0.0)
-qin  = daily[COL_INFLOW].astype(float).fillna(0.0)
-
-
-# Rainfall rolling windows (using data up to and including today)
-daily['rain_1d']   = rain
-daily['rain_3d']   = rain.rolling(3,  min_periods=1).sum()
-daily['rain_7d']   = rain.rolling(7,  min_periods=1).sum()
-daily['rain_14d']  = rain.rolling(14, min_periods=1).sum()
-daily['rain_30d']  = rain.rolling(30, min_periods=1).sum()
-daily['rain_45d']  = rain.rolling(45, min_periods=1).sum()
-
-daily['dam_1d']   = dam
-daily['dam_3d']   = dam.rolling(3,  min_periods=1).sum()
-daily['dam_7d']   = dam.rolling(7,  min_periods=1).sum()
-daily['dam_14d']  = dam.rolling(14, min_periods=    1).sum()
-daily['dam_30d']  = dam.rolling(30, min_periods=1).sum()            
-daily['dam_45d']  = dam.rolling(45, min_periods=1).sum()
-
-# Inflow rolling windows (use only past inflow: shift by 1 day)
-qin_shift = qin.shift(1)
-daily['qin_lag1']   = qin_shift
-daily['qin_3d']     = qin_shift.rolling(3,  min_periods=1).mean()
-daily['qin_7d']     = qin_shift.rolling(7,  min_periods=1).mean()
-daily['qin_14d']    = qin_shift.rolling(14, min_periods=1).mean()
-daily['qin_30d']    = qin_shift.rolling(30, min_periods=1).sum()
-
-
+# 3. Base lag feature
+qin = daily[COL_INFLOW].astype(float).fillna(0.0)
+daily['qin_30d'] = qin.shift(1).rolling(30, min_periods=1).sum()
 
 # Seasonality features (day of year)
 daily['doy']     = daily['date_day'].dt.dayofyear
@@ -467,35 +515,27 @@ daily['inflow_next30_log'] = np.log1p(daily['inflow_next30'])
 daily['year'] = daily['date_day'].dt.year
 
 daily_features = [
-    #'rain_1d','rain_3d',
-    #'rain_7d',
-    # 'rain_14d','rain_30d','rain_45d',
-    #'dam_7d','dam_14d',
-    #'dam_30d','dam_45d',
-    #'qin_lag1','qin_3d','qin_7d','qin_14d',
     'qin_30d',
-    #'sm_1d','sm_7d_mean','sm_14d_mean',
-    #'sm_30d_mean',
     'doy_sin','doy_cos'
 ]
 # Editable subbasin feature list (remove any items you want to test without)
 SELECTED_SUBBASIN_FEATURES = [
-    #'arain_SB1_7d',
-    #'arain_SB2_7d',
-    #'arain_SB3_7d',
-    'arain_SB4_7d',
-    'arain_SB1_30d',
-    #'arain_SB2_30d',
-    #'arain_SB3_30d',
-    'arain_SB4_30d',
-    #'asm_SB1_7d',
-    'asm_SB2_7d',
-    'asm_SB3_7d',
-    #'asm_SB4_7d',
-    'asm_SB1_30d',
-    'asm_SB2_30d',
-    'asm_SB3_30d',
-    'asm_SB4_30d',
+    #'arain_SB_SW_7d',
+    #'arain_SB_M_7d',
+    #'arain_SB_SE_7d',
+    'arain_SB_NW_7d',
+    'arain_SB_SW_30d',
+    #'arain_SB_M_30d',
+    #'arain_SB_SE_30d',
+    'arain_SB_NW_30d',
+    #'asm_SB_SW_7d',
+    'asm_SB_M_7d',
+    'asm_SB_SE_7d',
+    #'asm_SB_NW_7d',
+    'asm_SB_SW_30d',
+    'asm_SB_M_30d',
+    'asm_SB_SE_30d',
+    'asm_SB_NW_30d',
     #'arain_weighted_7d',
     #'arain_weighted_30d',
     #'asm_weighted_7d',
@@ -514,13 +554,72 @@ if len(selected_sub_features) == 0:
 
 daily_features += selected_sub_features
 
-daily_model_df = daily[['date_day','year'] + daily_features + ['inflow_next30','inflow_next30_log']].dropna().reset_index(drop=True)
+model_cols = ['date_day','year'] + daily_features + ['inflow_next30','inflow_next30_log']
+daily_model_input_df = daily[model_cols].copy()
+daily_model_input_df['split'] = np.select(
+    [
+        daily_model_input_df['year'] <= TRAIN_END,
+        (daily_model_input_df['year'] > TRAIN_END) & (daily_model_input_df['year'] <= VAL_END),
+        daily_model_input_df['year'] > VAL_END,
+    ],
+    ['train', 'val', 'test'],
+    default='unknown',
+)
+
+retention_rows = []
+for split_name, g in daily_model_input_df.groupby('split', dropna=False):
+    feature_complete = g[daily_features].notna().all(axis=1)
+    target_complete = g[['inflow_next30','inflow_next30_log']].notna().all(axis=1)
+    model_complete = g[model_cols].notna().all(axis=1)
+    retention_rows.append({
+        'split': split_name,
+        'rows_before_dropna': int(len(g)),
+        'rows_with_complete_selected_features': int(feature_complete.sum()),
+        'rows_with_complete_target': int(target_complete.sum()),
+        'rows_after_dropna': int(model_complete.sum()),
+        'rows_dropped': int((~model_complete).sum()),
+        'pct_rows_after_dropna': float(model_complete.mean() * 100.0) if len(g) else np.nan,
+    })
+
+retention_df = pd.DataFrame(retention_rows).sort_values('split')
+retention_path = OUT_DIR / 'daily_model_row_retention_by_split.csv'
+retention_df.to_csv(retention_path, index=False)
+print(f"Saved: {retention_path}")
+
+missing_rows = []
+for split_name, g in daily_model_input_df.groupby('split', dropna=False):
+    for col in daily_features + ['inflow_next30','inflow_next30_log']:
+        non_null = int(g[col].notna().sum())
+        missing_rows.append({
+            'split': split_name,
+            'column': col,
+            'non_null_rows': non_null,
+            'missing_rows': int(len(g) - non_null),
+            'pct_non_null': float((non_null / len(g)) * 100.0) if len(g) else np.nan,
+        })
+
+missing_df = pd.DataFrame(missing_rows).sort_values(['split', 'column'])
+missing_path = OUT_DIR / 'daily_model_missingness_by_split.csv'
+missing_df.to_csv(missing_path, index=False)
+print(f"Saved: {missing_path}")
+
+daily_model_df = daily_model_input_df[model_cols].dropna().reset_index(drop=True)
 
 # 6. Time-based split (same TRAIN_END / VAL_END logic)
 
 train_d = daily_model_df[daily_model_df['year'] <= TRAIN_END].copy()
 val_d   = daily_model_df[(daily_model_df['year'] > TRAIN_END) & (daily_model_df['year'] <= VAL_END)].copy()
 test_d  = daily_model_df[daily_model_df['year'] > VAL_END].copy()
+
+print(
+    "Daily model rows after feature/target cleanup: "
+    f"train={len(train_d)}, val={len(val_d)}, test={len(test_d)}"
+)
+if train_d.empty:
+    raise ValueError(
+        "No daily training rows survived feature/target cleanup. "
+        "Check date coverage and missing values in the selected model features."
+    )
 
 Xd_tr, Xd_v, Xd_t = train_d[daily_features], val_d[daily_features], test_d[daily_features]
 yd_tr_raw, yd_v_raw, yd_t_raw = train_d['inflow_next30'], val_d['inflow_next30'], test_d['inflow_next30']
