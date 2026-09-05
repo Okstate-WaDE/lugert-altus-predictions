@@ -1,0 +1,1780 @@
+"""
+Altus-Lugert Predictive Modeling
+- Configurable train/validation split
+- Simple models (Linear, Ridge, optional RF/XGB)
+- Robust CI bands (original-scale residual quantiles)
+- Plots and metrics saved to OUT_DIR
+"""
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+
+from math import sqrt
+
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import ParameterSampler
+
+# Optional models
+RF_AVAILABLE = False
+XGB_AVAILABLE = False
+try:
+    from sklearn.ensemble import RandomForestRegressor
+    RF_AVAILABLE = True
+except Exception:
+    pass
+try:
+    import xgboost as xgb
+    XGB_AVAILABLE = True
+except Exception:
+    pass
+
+# ---------------- CONFIG ----------------
+DATA_PATH = Path(r"C:\Users\aalec\OneDrive - Oklahoma A and M System\Desktop\Altus Project\ALTU_ALL.csv")
+OUT_DIR   = Path(r"C:\Users\aalec\OneDrive - Oklahoma A and M System\Desktop\Altus Project\model_outputs_v8")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+SUBBASIN_RAIN_PATH = Path(r"C:\Users\aalec\OneDrive - Oklahoma A and M System\Desktop\Altus Project\ERA5Land_daily_area_weighted_subbasin_rainfall.csv")
+SUBBASIN_SM_PATH = Path(r"C:\Users\aalec\OneDrive - Oklahoma A and M System\Desktop\Altus Project\ERA5Land_daily_area_weighted_subbasin_soil_moisture.csv")
+SUBBASIN_AREA_TOLERANCE_PCT = 2.0
+CANONICAL_SUBBASINS = [
+    {'subbasin_id': 'SB_SW', 'representative_area_m2': 878470000.0,  'reference_lon': -100.2800817, 'reference_lat': 35.3272738},
+    {'subbasin_id': 'SB_M',  'representative_area_m2': 937450000.0,  'reference_lon':  -99.8063283, 'reference_lat': 35.3290272},
+    {'subbasin_id': 'SB_SE', 'representative_area_m2': 1064410000.0, 'reference_lon':  -99.5099193, 'reference_lat': 35.1724732},
+    {'subbasin_id': 'SB_NW', 'representative_area_m2': 1405090000.0, 'reference_lon': -100.1718715, 'reference_lat': 35.4996085},
+]
+# Fixed split years
+TRAIN_START = 1995 # inclusive; older rows are only used for rolling feature history # 1995 is the earliest year with complete subbasin data
+TRAIN_END = 2019 # inclusive 2018 is best
+VAL_END   = 2024 # inclusive; test is > VAL_END 2024 is best
+
+# Validation split controls.
+# Use 'chronological' for true future-style validation.
+# Use 'year_grouped' to randomly hold out whole years inside TRAIN_START..VAL_END.
+# Use 'random_days_diagnostic' only as a leakage-prone diagnostic, not final scoring.
+VALIDATION_MODE = 'chronological'  # 'chronological', 'year_grouped', or 'random_days_diagnostic'
+VALIDATION_RANDOM_STATE = 16
+VALIDATION_YEAR_FRACTION = 0.20
+VALIDATION_YEARS = None  # example override for year_grouped: [2004, 2015, 2020]
+VALIDATION_RANDOM_DAY_FRACTION = 0.20
+VALIDATION_PURGE_DAYS = 30
+
+if TRAIN_START > TRAIN_END:
+    raise ValueError(f"TRAIN_START={TRAIN_START} must be <= TRAIN_END={TRAIN_END}.")
+if VALIDATION_MODE.lower() == 'chronological' and TRAIN_END >= VAL_END:
+    raise ValueError(f"For chronological validation, TRAIN_END={TRAIN_END} must be < VAL_END={VAL_END}.")
+
+# Flood-robustness controls
+FLOOD_QUANTILE = 0.90
+EVENT_QUANTILE = 0.75
+HIGH_QIN30_QUANTILE = 0.75
+MODEL_SELECTION_METRIC = 'FloodMAE'  # fallback to MAE if unavailable
+FORCE_BEST_MODEL = 'RF_DailyNext30'  # set to None to use automatic validation-based selection
+ISSUE_DAY_OF_MONTH = 1
+PERMUTATION_IMPORTANCE_REPEATS = 12
+RAINFALL_ROLLING_WINDOWS = [7, 14, 30, 45]
+RUN_HYPERPARAMETER_TUNING = False # set to True to run hyperparameter tuning (slower)
+TUNING_MODE = 'random'  # 'random' or 'fixed_grid'
+TUNING_SELECTION_METRIC = 'MAE'
+TUNING_GAP_PENALTY = 0.25
+TUNING_RANDOM_STATE = 16
+RF_RANDOM_SEARCH_ITER = 50
+XGB_RANDOM_SEARCH_ITER = 75
+
+RF_DEFAULT_PARAMS = {
+    'n_estimators': 500,
+    'max_depth': 4,
+    'min_samples_leaf': 20,
+    'max_features': .5,
+    'random_state': 16,
+    'n_jobs': 1,
+}
+RF_TUNING_GRID = [
+    {'n_estimators': 500, 'max_depth': 5, 'min_samples_leaf': 20, 'max_features': 'sqrt', 'random_state': 16, 'n_jobs': 1},
+    {'n_estimators': 500, 'max_depth': 6, 'min_samples_leaf': 15, 'max_features': 'sqrt', 'random_state': 16, 'n_jobs': 1},
+    {'n_estimators': 800, 'max_depth': 7, 'min_samples_leaf': 15, 'max_features': 'sqrt', 'random_state': 16, 'n_jobs': 1},
+    {'n_estimators': 800, 'max_depth': 8, 'min_samples_leaf': 9,  'max_features': 'sqrt', 'random_state': 16, 'n_jobs': 1},
+    {'n_estimators': 500, 'max_depth': 6, 'min_samples_leaf': 20, 'max_features': 0.5,    'random_state': 16, 'n_jobs': 1},
+    {'n_estimators': 800, 'max_depth': 7, 'min_samples_leaf': 10, 'max_features': 0.5,    'random_state': 16, 'n_jobs': 1},
+]
+RF_TUNING_DISTRIBUTIONS = {
+    'n_estimators': [300, 500, 800, 1200],
+    'max_depth': [3, 4, 5, 6, 7, 8, 10, None],
+    'min_samples_leaf': [5, 10, 15, 20, 30, 50],
+    'max_features': ['sqrt', 0.4, 0.5, 0.7, 1.0],
+}
+
+XGB_DEFAULT_PARAMS = {
+    'n_estimators': 300,
+    'learning_rate': 0.01,
+    'max_depth': 3,
+    'min_child_weight': 40,
+    'subsample': 0.7,
+    'colsample_bytree': 0.6,
+    'gamma': 5.0,
+    'reg_lambda': 100.0,
+    'reg_alpha': 0.5,
+    'objective': 'reg:squarederror',
+    'random_state': 0,
+    'n_jobs': 1,
+}
+XGB_TUNING_GRID = [
+    {'n_estimators': 200, 'learning_rate': 0.03, 'max_depth': 2, 'min_child_weight': 20, 'subsample': 0.7, 'colsample_bytree': 0.7, 'gamma': 2.0, 'reg_lambda': 20.0, 'reg_alpha': 1.0, 'objective': 'reg:squarederror', 'random_state': 0, 'n_jobs': 1},
+    {'n_estimators': 300, 'learning_rate': 0.03, 'max_depth': 2, 'min_child_weight': 40, 'subsample': 0.7, 'colsample_bytree': 0.7, 'gamma': 4.0, 'reg_lambda': 30.0, 'reg_alpha': 1.0, 'objective': 'reg:squarederror', 'random_state': 0, 'n_jobs': 1},
+    {'n_estimators': 300, 'learning_rate': 0.03, 'max_depth': 3, 'min_child_weight': 20, 'subsample': 0.7, 'colsample_bytree': 0.7, 'gamma': 2.0, 'reg_lambda': 20.0, 'reg_alpha': 1.0, 'objective': 'reg:squarederror', 'random_state': 0, 'n_jobs': 1},
+    {'n_estimators': 400, 'learning_rate': 0.02, 'max_depth': 3, 'min_child_weight': 30, 'subsample': 0.7, 'colsample_bytree': 0.7, 'gamma': 4.0, 'reg_lambda': 30.0, 'reg_alpha': 2.0, 'objective': 'reg:squarederror', 'random_state': 0, 'n_jobs': 1},
+    {'n_estimators': 300, 'learning_rate': 0.03, 'max_depth': 4, 'min_child_weight': 20, 'subsample': 0.7, 'colsample_bytree': 0.7, 'gamma': 2.0, 'reg_lambda': 20.0, 'reg_alpha': 1.0, 'objective': 'reg:squarederror', 'random_state': 0, 'n_jobs': 1},
+    {'n_estimators': 500, 'learning_rate': 0.02, 'max_depth': 2, 'min_child_weight': 20, 'subsample': 0.8, 'colsample_bytree': 0.8, 'gamma': 2.0, 'reg_lambda': 20.0, 'reg_alpha': 1.0, 'objective': 'reg:squarederror', 'random_state': 0, 'n_jobs': 1},
+]
+XGB_TUNING_DISTRIBUTIONS = {
+    'n_estimators': [200, 300, 400, 700, 1000],
+    'learning_rate': [0.01, 0.02, 0.03, 0.05],
+    'max_depth': [1, 2, 3, 4],
+    'min_child_weight': [10, 20, 40, 80],
+    'subsample': [0.6, 0.7, 0.8, 0.9],
+    'colsample_bytree': [0.5, 0.6, 0.7, 0.8],
+    'gamma': [0.0, 1.0, 2.0, 5.0, 10.0],
+    'reg_lambda': [5.0, 10.0, 20.0, 50.0, 100.0],
+    'reg_alpha': [0.0, 0.5, 1.0, 2.0, 5.0],
+}
+
+
+# Exact CSV headers
+COL_DAY         = 'day'
+COL_INFLOW      = 'inflow adj'
+COL_RAIN_DAM    = 'rainfall inches (7A to Dam)'
+COL_RAIN_BSN    = 'rainfall inches (7A to BSN)'
+COL_MONTH       = 'month'
+COL_YEAR        = 'year'
+
+# ---------------- HELPERS ----------------
+def extra_metrics(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = sqrt(mean_squared_error(y_true, y_pred))
+    r2   = r2_score(y_true, y_pred)
+    return {"MAE": mae, "RMSE": rmse, "R2": r2}
+
+def flood_focus_metrics(y_true, y_pred, flood_threshold=None, event_threshold=None):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    out = {}
+
+    if flood_threshold is not None:
+        flood_mask = y_true >= float(flood_threshold)
+        out['FloodThreshold'] = float(flood_threshold)
+        out['FloodN'] = int(flood_mask.sum())
+        if flood_mask.sum() > 0:
+            out['FloodMAE'] = float(mean_absolute_error(y_true[flood_mask], y_pred[flood_mask]))
+            out['FloodRMSE'] = float(sqrt(mean_squared_error(y_true[flood_mask], y_pred[flood_mask])))
+        else:
+            out['FloodMAE'] = np.nan
+            out['FloodRMSE'] = np.nan
+
+    if event_threshold is not None:
+        event_true = y_true >= float(event_threshold)
+        event_pred = y_pred >= float(event_threshold)
+        tp = int(np.sum(event_true & event_pred))
+        fn = int(np.sum(event_true & (~event_pred)))
+        fp = int(np.sum((~event_true) & event_pred))
+        out['EventThreshold'] = float(event_threshold)
+        out['EventN'] = int(event_true.sum())
+        out['EventRecall'] = float(tp / (tp + fn)) if (tp + fn) > 0 else np.nan
+        out['EventPrecision'] = float(tp / (tp + fp)) if (tp + fp) > 0 else np.nan
+
+    return out
+
+def eval_model_log(name, model, X_i, y_true_raw, flood_threshold=None, event_threshold=None):
+    """Models trained on log1p(target); evaluate on original scale."""
+    if flood_threshold is None and 'flood_threshold_train' in globals():
+        flood_threshold = globals().get('flood_threshold_train')
+    if event_threshold is None and 'event_threshold_train' in globals():
+        event_threshold = globals().get('event_threshold_train')
+
+    pred_log = model.predict(X_i)
+    pred_raw = np.expm1(pred_log)
+    res = extra_metrics(y_true_raw, pred_raw)
+    res.update(flood_focus_metrics(y_true_raw, pred_raw, flood_threshold=flood_threshold, event_threshold=event_threshold))
+    res['name'] = name
+    return res, pred_raw
+
+def eval_model(name, model, X_i, y_true_raw, flood_threshold=None, event_threshold=None):
+    pred_raw = model.predict(X_i)
+    res = extra_metrics(y_true_raw, pred_raw)
+    res.update(flood_focus_metrics(y_true_raw, pred_raw, flood_threshold=flood_threshold, event_threshold=event_threshold))
+    res['name'] = name
+    return res, pred_raw
+
+def safe_filename(s):
+    return ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in str(s))
+
+
+def normalize_validation_mode(mode):
+    mode_key = str(mode).strip().lower()
+    aliases = {
+        'random_days_diagnostic': 'random_days',
+        'random_day_diagnostic': 'random_days',
+        'random_days': 'random_days',
+        'year_grouped': 'year_grouped',
+        'grouped_year': 'year_grouped',
+        'chronological': 'chronological',
+        'time': 'chronological',
+    }
+    if mode_key not in aliases:
+        raise ValueError(
+            f"Unknown VALIDATION_MODE='{mode}'. "
+            "Use 'chronological', 'year_grouped', or 'random_days_diagnostic'."
+        )
+    return aliases[mode_key]
+
+
+def assign_validation_splits(df):
+    split_df = df[['date_day', 'year']].copy()
+    split_df['date_day'] = pd.to_datetime(split_df['date_day'])
+    split_df['year'] = split_df['year'].astype(int)
+
+    mode = normalize_validation_mode(VALIDATION_MODE)
+    years = split_df['year']
+    dates = split_df['date_day']
+    labels = pd.Series('unused', index=split_df.index, dtype='object')
+
+    pretrain_mask = years < TRAIN_START
+    test_mask = years > VAL_END
+    dev_mask = (years >= TRAIN_START) & (years <= VAL_END)
+    labels.loc[pretrain_mask] = 'pretrain_excluded'
+    labels.loc[test_mask] = 'test'
+
+    meta = {
+        'validation_mode': mode,
+        'train_start': TRAIN_START,
+        'train_end': TRAIN_END,
+        'val_end': VAL_END,
+        'validation_random_state': VALIDATION_RANDOM_STATE,
+        'validation_purge_days': VALIDATION_PURGE_DAYS,
+    }
+
+    if not dev_mask.any():
+        raise ValueError("No rows found between TRAIN_START and VAL_END.")
+
+    if mode == 'chronological':
+        train_mask = dev_mask & (years <= TRAIN_END)
+        val_mask = dev_mask & (years > TRAIN_END)
+        labels.loc[train_mask] = 'train'
+        labels.loc[val_mask] = 'val'
+        meta.update({
+            'validation_description': f'chronological val years {TRAIN_END + 1}-{VAL_END}',
+            'validation_years': ','.join(str(y) for y in range(TRAIN_END + 1, VAL_END + 1)),
+        })
+
+    elif mode == 'year_grouped':
+        eligible_years = np.array(sorted(years.loc[dev_mask].unique()), dtype=int)
+        if len(eligible_years) <= 1:
+            raise ValueError("Need at least two years between TRAIN_START and VAL_END for year_grouped validation.")
+
+        if VALIDATION_YEARS is None:
+            n_val_years = max(1, int(round(len(eligible_years) * float(VALIDATION_YEAR_FRACTION))))
+            n_val_years = min(n_val_years, len(eligible_years) - 1)
+            rng = np.random.default_rng(VALIDATION_RANDOM_STATE)
+            val_years = sorted(rng.choice(eligible_years, size=n_val_years, replace=False).astype(int).tolist())
+        else:
+            val_years = sorted({int(y) for y in VALIDATION_YEARS})
+            invalid_years = [y for y in val_years if y not in set(eligible_years)]
+            if invalid_years:
+                raise ValueError(
+                    f"VALIDATION_YEARS contains years outside TRAIN_START..VAL_END: {invalid_years}"
+                )
+
+        val_mask = dev_mask & years.isin(val_years)
+        train_mask = dev_mask & ~val_mask
+
+        if VALIDATION_PURGE_DAYS > 0:
+            purge_delta = pd.Timedelta(days=int(VALIDATION_PURGE_DAYS))
+            purge_mask = pd.Series(False, index=split_df.index)
+            for y in val_years:
+                val_start = pd.Timestamp(year=int(y), month=1, day=1)
+                val_end = pd.Timestamp(year=int(y), month=12, day=31)
+                purge_mask = purge_mask | (train_mask & dates.between(val_start - purge_delta, val_end + purge_delta))
+            labels.loc[purge_mask] = 'purged_from_training'
+            train_mask = train_mask & ~purge_mask
+
+        labels.loc[train_mask] = 'train'
+        labels.loc[val_mask] = 'val'
+        meta.update({
+            'validation_description': 'randomly held-out whole validation years',
+            'validation_years': ','.join(str(y) for y in val_years),
+            'validation_year_fraction': VALIDATION_YEAR_FRACTION,
+        })
+
+    elif mode == 'random_days':
+        dev_index = split_df.index[dev_mask].to_numpy()
+        n_val = max(1, int(round(len(dev_index) * float(VALIDATION_RANDOM_DAY_FRACTION))))
+        n_val = min(n_val, len(dev_index) - 1)
+        rng = np.random.default_rng(VALIDATION_RANDOM_STATE)
+        val_index = rng.choice(dev_index, size=n_val, replace=False)
+        labels.loc[dev_mask] = 'train'
+        labels.loc[val_index] = 'val'
+        meta.update({
+            'validation_description': 'randomly held-out days; diagnostic only because nearby target windows overlap',
+            'validation_years': 'mixed_days',
+            'validation_random_day_fraction': VALIDATION_RANDOM_DAY_FRACTION,
+        })
+        print(
+            "Warning: random_days_diagnostic mixes nearby days across train/val. "
+            "Use it as a diagnostic, not as the final future-performance estimate."
+        )
+
+    if (labels == 'train').sum() == 0:
+        raise ValueError("Validation split produced zero training rows.")
+    if (labels == 'val').sum() == 0:
+        raise ValueError("Validation split produced zero validation rows.")
+
+    return labels, meta
+
+
+def save_split_summary(df, split_meta, out_dir=OUT_DIR):
+    rows = []
+    for split_name, g in df.groupby('split', dropna=False):
+        rows.append({
+            'split': split_name,
+            'rows': int(len(g)),
+            'start_date': g['date_day'].min(),
+            'end_date': g['date_day'].max(),
+            'min_year': int(g['year'].min()) if len(g) else np.nan,
+            'max_year': int(g['year'].max()) if len(g) else np.nan,
+            'year_count': int(g['year'].nunique()) if len(g) else 0,
+        })
+    summary = pd.DataFrame(rows).sort_values('split')
+    for key, value in split_meta.items():
+        summary[key] = value
+
+    out_csv = out_dir / 'validation_split_summary.csv'
+    summary.to_csv(out_csv, index=False)
+    print(f"Saved: {out_csv}")
+    print("\n=== VALIDATION SPLIT SUMMARY ===")
+    print(summary[['split', 'rows', 'start_date', 'end_date', 'year_count']])
+    print(f"Validation mode: {split_meta.get('validation_mode')} ({split_meta.get('validation_description')})")
+    return summary
+
+
+def shade_split_spans(ax, split_df):
+    styles = {
+        'pretrain_excluded': ('0.5', 0.08, f'Pretrain excluded (< {TRAIN_START})'),
+        'train': ('tab:green', 0.10, 'Train'),
+        'val': ('tab:orange', 0.10, 'Val'),
+        'test': ('tab:blue', 0.08, f'Test (> {VAL_END})'),
+        'purged_from_training': ('0.5', 0.06, 'Purged from training'),
+    }
+    mode = normalize_validation_mode(VALIDATION_MODE)
+    allowed_splits = set(styles)
+    if mode == 'random_days':
+        allowed_splits = {'pretrain_excluded', 'test'}
+
+    x = (
+        split_df[['date_day', 'split']]
+        .dropna(subset=['date_day', 'split'])
+        .sort_values('date_day')
+    )
+    x = x[x['split'].isin(allowed_splits)]
+    if x.empty:
+        return []
+
+    handles = []
+    seen = set()
+    group_id = x['split'].ne(x['split'].shift()).cumsum()
+    for _, g in x.groupby(group_id):
+        split_name = g['split'].iloc[0]
+        color, alpha, label = styles[split_name]
+        ax.axvspan(g['date_day'].iloc[0], g['date_day'].iloc[-1] + pd.Timedelta(days=1), color=color, alpha=alpha, zorder=0)
+        if split_name not in seen:
+            handles.append(Patch(facecolor=color, alpha=alpha, label=label))
+            seen.add(split_name)
+    return handles
+
+
+def build_tuning_candidates(default_params, fixed_grid, param_distributions, n_iter, random_state, mode):
+    mode_key = str(mode).strip().lower()
+    candidates = [dict(default_params)]
+
+    if mode_key == 'fixed_grid':
+        candidates.extend(dict(p) for p in fixed_grid)
+    elif mode_key == 'random':
+        sampled = ParameterSampler(param_distributions, n_iter=int(n_iter), random_state=int(random_state))
+        for params in sampled:
+            candidate = dict(default_params)
+            candidate.update(dict(params))
+            candidates.append(candidate)
+    else:
+        raise ValueError(f"Unknown TUNING_MODE='{mode}'. Use 'random' or 'fixed_grid'.")
+
+    unique = []
+    seen = set()
+    for params in candidates:
+        key = tuple(sorted((k, str(v)) for k, v in params.items()))
+        if key not in seen:
+            unique.append(params)
+            seen.add(key)
+    return unique
+
+
+def build_baseline_predictions(train_df, eval_df):
+    train_target = train_df['inflow_next30'].astype(float)
+    train_mean = float(train_target.mean())
+    train_median = float(train_target.median())
+    monthly_median = train_df.groupby(train_df['date_day'].dt.month)['inflow_next30'].median()
+
+    n = len(eval_df)
+    preds = {
+        'Baseline_TrainMean_DailyNext30': np.full(n, train_mean, dtype=float),
+        'Baseline_TrainMedian_DailyNext30': np.full(n, train_median, dtype=float),
+        'Baseline_MonthlyTrainMedian_DailyNext30': (
+            eval_df['date_day']
+            .dt.month
+            .map(monthly_median)
+            .fillna(train_median)
+            .to_numpy(dtype=float)
+        ),
+    }
+
+    if 'qin_30d' in eval_df.columns:
+        preds['Baseline_PersistenceQin30_DailyNext30'] = eval_df['qin_30d'].to_numpy(dtype=float)
+    if 'qin_90d' in eval_df.columns:
+        preds['Baseline_PersistenceQin90Div3_DailyNext30'] = (eval_df['qin_90d'] / 3.0).to_numpy(dtype=float)
+    if 'qin_180d' in eval_df.columns:
+        preds['Baseline_PersistenceQin180Div6_DailyNext30'] = (eval_df['qin_180d'] / 6.0).to_numpy(dtype=float)
+    if 'qin_365d' in eval_df.columns:
+        preds['Baseline_PersistenceQin365Scaled_DailyNext30'] = (eval_df['qin_365d'] * (30.0 / 365.0)).to_numpy(dtype=float)
+
+    return preds
+
+
+def evaluate_baselines(train_df, split_frames, flood_threshold, event_threshold, out_dir=OUT_DIR):
+    rows = []
+    for split_name, split_df in split_frames.items():
+        y_true = split_df['inflow_next30'].to_numpy(dtype=float)
+        for baseline_name, y_pred in build_baseline_predictions(train_df, split_df).items():
+            m = extra_metrics(y_true, y_pred)
+            m.update(flood_focus_metrics(
+                y_true,
+                y_pred,
+                flood_threshold=flood_threshold,
+                event_threshold=event_threshold,
+            ))
+            m['split'] = split_name
+            m['name'] = baseline_name
+            m['kind'] = 'baseline'
+            rows.append(m)
+
+    baseline_df = pd.DataFrame(rows).sort_values(['split', 'MAE', 'name'])
+    out_csv = out_dir / 'metrics_baselines_daily_next30.csv'
+    baseline_df.to_csv(out_csv, index=False)
+    print(f"Saved: {out_csv}")
+    print("\n=== DAILY NEXT-30D BASELINE METRICS (lower is better) ===")
+    print(baseline_df)
+    return baseline_df
+
+
+def feature_importance_df(model_name, model, feature_names):
+    if hasattr(model, 'feature_importances_'):
+        values = np.asarray(model.feature_importances_, dtype=float)
+        importance_kind = 'feature_importances_'
+    elif hasattr(model, 'coef_'):
+        values = np.abs(np.asarray(model.coef_, dtype=float).ravel())
+        importance_kind = 'abs_coef_log_target'
+    else:
+        return None
+
+    if len(values) != len(feature_names):
+        print(
+            f"Skipping feature importance for {model_name}: "
+            f"{len(values)} values for {len(feature_names)} features."
+        )
+        return None
+
+    out = pd.DataFrame({
+        'model': model_name,
+        'feature': feature_names,
+        'importance': values,
+        'importance_kind': importance_kind,
+    }).sort_values('importance', ascending=False).reset_index(drop=True)
+    out['rank'] = np.arange(1, len(out) + 1)
+    return out
+
+
+def save_feature_importance_outputs(models, feature_names, best_model_name, out_dir=OUT_DIR, top_n=20):
+    frames = []
+    for model_name, model in models.items():
+        imp = feature_importance_df(model_name, model, feature_names)
+        if imp is not None:
+            frames.append(imp)
+
+    if not frames:
+        print("Skipping feature importance output: no fitted models expose importances or coefficients.")
+        return pd.DataFrame()
+
+    all_importance = pd.concat(frames, ignore_index=True)
+    out_csv = out_dir / 'feature_importance_native.csv'
+    all_importance.to_csv(out_csv, index=False)
+    print(f"Saved: {out_csv}")
+
+    best_importance = all_importance[all_importance['model'] == best_model_name].copy()
+    if not best_importance.empty:
+        plot_df = (
+            best_importance
+            .sort_values('importance', ascending=False)
+            .head(top_n)
+            .sort_values('importance', ascending=True)
+        )
+        plt.figure(figsize=(9, max(4, 0.32 * len(plot_df))))
+        plt.barh(plot_df['feature'], plot_df['importance'])
+        plt.xlabel(plot_df['importance_kind'].iloc[0])
+        plt.title(f'{best_model_name} Feature Importance')
+        plt.tight_layout()
+        out_png = out_dir / f'feature_importance_native_{safe_filename(best_model_name)}.png'
+        plt.savefig(out_png, dpi=150)
+        plt.close()
+        print(f"Saved: {out_png}")
+
+    return all_importance
+
+
+def permutation_importance_mae_df(model_name, predict_raw_fn, X_i, y_true_raw, feature_names, n_repeats=12, random_state=0):
+    X_base = np.asarray(X_i, dtype=float)
+    y_true_raw = np.asarray(y_true_raw, dtype=float)
+    rng = np.random.default_rng(random_state)
+
+    baseline_pred = np.asarray(predict_raw_fn(X_base), dtype=float)
+    baseline_mae = float(mean_absolute_error(y_true_raw, baseline_pred))
+    rows = []
+
+    for j, feature in enumerate(feature_names):
+        increases = []
+        for _ in range(n_repeats):
+            X_perm = X_base.copy()
+            X_perm[:, j] = rng.permutation(X_perm[:, j])
+            perm_pred = np.asarray(predict_raw_fn(X_perm), dtype=float)
+            perm_mae = float(mean_absolute_error(y_true_raw, perm_pred))
+            increases.append(perm_mae - baseline_mae)
+
+        rows.append({
+            'model': model_name,
+            'feature': feature,
+            'baseline_mae': baseline_mae,
+            'mae_increase_mean': float(np.mean(increases)),
+            'mae_increase_std': float(np.std(increases, ddof=1)) if len(increases) > 1 else 0.0,
+            'n_repeats': int(n_repeats),
+        })
+
+    out = pd.DataFrame(rows).sort_values('mae_increase_mean', ascending=False).reset_index(drop=True)
+    out['rank'] = np.arange(1, len(out) + 1)
+    return out
+
+
+def save_permutation_importance_outputs(predictors, X_i, y_true_raw, feature_names, best_model_name, out_dir=OUT_DIR, n_repeats=12, top_n=20):
+    if not predictors:
+        print("Skipping permutation importance output: no prediction functions were registered.")
+        return pd.DataFrame()
+
+    frames = []
+    for model_name, predict_raw_fn in predictors.items():
+        frames.append(
+            permutation_importance_mae_df(
+                model_name,
+                predict_raw_fn=predict_raw_fn,
+                X_i=X_i,
+                y_true_raw=y_true_raw,
+                feature_names=feature_names,
+                n_repeats=n_repeats,
+                random_state=0,
+            )
+        )
+
+    all_importance = pd.concat(frames, ignore_index=True)
+    out_csv = out_dir / 'feature_importance_permutation_val_mae.csv'
+    all_importance.to_csv(out_csv, index=False)
+    print(f"Saved: {out_csv}")
+
+    best_importance = all_importance[all_importance['model'] == best_model_name].copy()
+    if not best_importance.empty:
+        plot_df = (
+            best_importance
+            .sort_values('mae_increase_mean', ascending=False)
+            .head(top_n)
+            .sort_values('mae_increase_mean', ascending=True)
+        )
+        plt.figure(figsize=(9, max(4, 0.32 * len(plot_df))))
+        plt.barh(plot_df['feature'], plot_df['mae_increase_mean'])
+        plt.xlabel('Validation MAE increase after shuffle')
+        plt.title(f'{best_model_name} Permutation Importance')
+        plt.tight_layout()
+        out_png = out_dir / f'feature_importance_permutation_val_mae_{safe_filename(best_model_name)}.png'
+        plt.savefig(out_png, dpi=150)
+        plt.close()
+        print(f"Saved: {out_png}")
+
+    return all_importance
+
+
+def tune_log_target_regressor(
+    model_name,
+    model_factory,
+    param_candidates,
+    X_tr_i,
+    y_tr_log,
+    y_tr_raw,
+    X_v_i,
+    y_v_raw,
+    selection_metric='MAE',
+    gap_penalty=0.25,
+    out_dir=OUT_DIR,
+):
+    rows = []
+    if len(param_candidates) == 0:
+        raise ValueError(f"No hyperparameter candidates provided for {model_name}.")
+
+    print(f"\n=== {model_name} HYPERPARAMETER TUNING ===")
+    print(f"Testing {len(param_candidates)} candidates using TUNING_MODE='{TUNING_MODE}'.")
+    for candidate_id, params in enumerate(param_candidates, start=1):
+        model = model_factory(params)
+        model.fit(X_tr_i, y_tr_log)
+
+        train_metrics, _ = eval_model_log(f'{model_name}_candidate_{candidate_id}', model, X_tr_i, y_tr_raw)
+        val_metrics, _ = eval_model_log(f'{model_name}_candidate_{candidate_id}', model, X_v_i, y_v_raw)
+
+        row = {'model': model_name, 'candidate': candidate_id}
+        row.update(params)
+        for key, value in train_metrics.items():
+            if key != 'name':
+                row[f'train_{key}'] = value
+        for key, value in val_metrics.items():
+            if key != 'name':
+                row[f'val_{key}'] = value
+        rows.append(row)
+
+    tuning_df = pd.DataFrame(rows)
+    metric_candidates = [selection_metric, 'MAE', 'RMSE']
+    selected_metric = None
+    for metric in metric_candidates:
+        col = f'val_{metric}'
+        if col in tuning_df.columns and tuning_df[col].notna().any():
+            selected_metric = metric
+            break
+    if selected_metric is None:
+        raise ValueError(f"No usable validation metric found for tuning {model_name}.")
+
+    val_col = f'val_{selected_metric}'
+    train_col = f'train_{selected_metric}'
+    gap_col = f'gap_{selected_metric}'
+    tuning_score_col = f'tuning_score_{selected_metric}'
+
+    if train_col in tuning_df.columns:
+        tuning_df[gap_col] = tuning_df[val_col] - tuning_df[train_col]
+        tuning_df[tuning_score_col] = tuning_df[val_col] + float(gap_penalty) * tuning_df[gap_col].clip(lower=0.0)
+    else:
+        tuning_df[gap_col] = np.nan
+        tuning_df[tuning_score_col] = tuning_df[val_col]
+
+    sort_cols = [tuning_score_col, val_col]
+    for col in ['val_MAE', 'val_RMSE']:
+        if col in tuning_df.columns and col not in sort_cols:
+            sort_cols.append(col)
+
+    ranked = tuning_df.sort_values(sort_cols).reset_index(drop=True)
+    ranked['tuning_rank'] = np.arange(1, len(ranked) + 1)
+    out_csv = out_dir / f'hyperparameter_tuning_{safe_filename(model_name)}.csv'
+    ranked.to_csv(out_csv, index=False)
+    print(f"Saved: {out_csv}")
+
+    best = ranked.iloc[0]
+    best_params = dict(param_candidates[int(best['candidate']) - 1])
+
+    print(
+        f"Selected {model_name} params by {tuning_score_col} "
+        f"(val_{selected_metric} plus {gap_penalty:.2f}x positive train/val gap):"
+    )
+    print(pd.DataFrame([best[['candidate'] + sort_cols + list(param_candidates[0].keys())]]).to_string(index=False))
+    return best_params, ranked
+
+
+def plot_with_ci_band(df, actual_col, pred_col, lo_col, hi_col, title, fname, out_dir=OUT_DIR):
+    plt.figure(figsize=(10,5))
+    plt.plot(df['date'], df[actual_col], label='Actual', linewidth=2.5)
+    plt.plot(df['date'], df[pred_col], label='Prediction', linewidth=1.8)
+    plt.fill_between(df['date'], df[lo_col], df[hi_col], alpha=0.25, label='CI')
+    plt.title(f'{title}'); plt.xlabel('Date'); plt.ylabel('Inflow')
+    plt.grid(True); plt.legend(); plt.tight_layout()
+    outpath = out_dir / fname
+    plt.savefig(outpath, dpi=150); plt.close()
+    print(f"Saved: {outpath}")
+
+def build_environment_change_diagnostics(daily_df, event_threshold, flood_threshold, out_dir=OUT_DIR):
+    env_cols = ['date_day', 'year', COL_INFLOW, 'inflow_next30']
+    if 'split' in daily_df.columns:
+        env_cols.append('split')
+    env = daily_df[env_cols].copy()
+    env['daily_inflow'] = pd.to_numeric(env[COL_INFLOW], errors='coerce')
+    env['inflow_next30'] = pd.to_numeric(env['inflow_next30'], errors='coerce')
+    env = env.dropna(subset=['date_day', 'year', 'daily_inflow', 'inflow_next30'])
+    env['year'] = env['year'].astype(int)
+    env['event_day'] = env['inflow_next30'] >= float(event_threshold)
+    env['flood_day'] = env['inflow_next30'] >= float(flood_threshold)
+
+    if env.empty:
+        print("Skipping environmental change diagnostics: no complete rows.")
+        return pd.DataFrame()
+
+    annual = (
+        env.groupby('year')
+        .agg(
+            n_days=('inflow_next30', 'size'),
+            daily_inflow_mean=('daily_inflow', 'mean'),
+            daily_inflow_std=('daily_inflow', 'std'),
+            daily_inflow_q25=('daily_inflow', lambda s: s.quantile(0.25)),
+            daily_inflow_median=('daily_inflow', 'median'),
+            daily_inflow_q75=('daily_inflow', lambda s: s.quantile(0.75)),
+            daily_inflow_q90=('daily_inflow', lambda s: s.quantile(0.90)),
+            inflow_next30_mean=('inflow_next30', 'mean'),
+            inflow_next30_std=('inflow_next30', 'std'),
+            inflow_next30_q25=('inflow_next30', lambda s: s.quantile(0.25)),
+            inflow_next30_median=('inflow_next30', 'median'),
+            inflow_next30_q75=('inflow_next30', lambda s: s.quantile(0.75)),
+            inflow_next30_q90=('inflow_next30', lambda s: s.quantile(0.90)),
+            event_days=('event_day', 'sum'),
+            flood_days=('flood_day', 'sum'),
+        )
+        .reset_index()
+        .sort_values('year')
+    )
+    annual['daily_inflow_iqr'] = annual['daily_inflow_q75'] - annual['daily_inflow_q25']
+    annual['inflow_next30_iqr'] = annual['inflow_next30_q75'] - annual['inflow_next30_q25']
+    annual['event_rate'] = annual['event_days'] / annual['n_days']
+    annual['flood_rate'] = annual['flood_days'] / annual['n_days']
+    annual['event_threshold_train'] = float(event_threshold)
+    annual['flood_threshold_train'] = float(flood_threshold)
+    if 'split' in env.columns:
+        split_counts = (
+            env.groupby(['year', 'split'])
+            .size()
+            .rename('split_days')
+            .reset_index()
+            .sort_values(['year', 'split_days'], ascending=[True, False])
+        )
+        annual_split = split_counts.drop_duplicates('year')[['year', 'split']]
+        annual = annual.merge(annual_split.rename(columns={'split': 'dominant_split'}), on='year', how='left')
+
+    rolling_cols = [
+        'daily_inflow_std',
+        'daily_inflow_iqr',
+        'inflow_next30_std',
+        'inflow_next30_iqr',
+        'inflow_next30_q90',
+        'event_rate',
+        'flood_rate',
+    ]
+    for col in rolling_cols:
+        annual[f'{col}_roll3'] = annual[col].rolling(3, min_periods=1).mean()
+
+    out_csv = out_dir / 'environment_change_annual_diagnostics.csv'
+    annual.to_csv(out_csv, index=False)
+    print(f"Saved: {out_csv}")
+
+    def shade_splits(ax):
+        ymin, ymax = annual['year'].min() - 0.5, annual['year'].max() + 0.5
+        mode = normalize_validation_mode(VALIDATION_MODE)
+        if mode == 'chronological' or 'dominant_split' not in annual.columns:
+            if ymin < TRAIN_START - 0.5:
+                ax.axvspan(ymin, TRAIN_START - 0.5, color='0.5', alpha=0.08, zorder=0)
+            ax.axvspan(TRAIN_START - 0.5, TRAIN_END + 0.5, color='tab:green', alpha=0.08, zorder=0)
+            ax.axvspan(TRAIN_END + 0.5, VAL_END + 0.5, color='tab:orange', alpha=0.08, zorder=0)
+            ax.axvspan(VAL_END + 0.5, ymax, color='tab:blue', alpha=0.06, zorder=0)
+            return
+
+        styles = {
+            'pretrain_excluded': ('0.5', 0.08),
+            'train': ('tab:green', 0.08),
+            'val': ('tab:orange', 0.08),
+            'test': ('tab:blue', 0.06),
+            'purged_from_training': ('0.5', 0.06),
+        }
+        annual_shades = annual[['year', 'dominant_split']].dropna().sort_values('year')
+        group_id = annual_shades['dominant_split'].ne(annual_shades['dominant_split'].shift()).cumsum()
+        for _, g in annual_shades.groupby(group_id):
+            split_name = g['dominant_split'].iloc[0]
+            if split_name not in styles:
+                continue
+            color, alpha = styles[split_name]
+            ax.axvspan(g['year'].min() - 0.5, g['year'].max() + 0.5, color=color, alpha=alpha, zorder=0)
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 11), sharex=True)
+    years = annual['year']
+
+    shade_splits(axes[0])
+    axes[0].plot(years, annual['inflow_next30_iqr'], marker='o', linewidth=1.2, label='Annual IQR')
+    axes[0].plot(years, annual['inflow_next30_iqr_roll3'], linewidth=2.2, label='3-year rolling IQR')
+    axes[0].plot(years, annual['inflow_next30_std_roll3'], linewidth=1.8, linestyle='--', label='3-year rolling std')
+    axes[0].set_ylabel('Next-30 inflow spread')
+    axes[0].set_title('Environmental Change Diagnostics: Inflow Volatility and High-Flow Frequency')
+    axes[0].grid(True, alpha=0.35)
+    axes[0].legend(fontsize='small', loc='upper right')
+
+    shade_splits(axes[1])
+    axes[1].plot(years, annual['event_rate'] * 100.0, marker='o', linewidth=1.2, label=f'Event rate >= {event_threshold:.0f}')
+    axes[1].plot(years, annual['event_rate_roll3'] * 100.0, linewidth=2.2, label='3-year rolling event rate')
+    axes[1].plot(years, annual['flood_rate_roll3'] * 100.0, linewidth=1.8, linestyle='--', label=f'3-year flood rate >= {flood_threshold:.0f}')
+    axes[1].set_ylabel('Days per year (%)')
+    axes[1].grid(True, alpha=0.35)
+    axes[1].legend(fontsize='small', loc='upper right')
+
+    shade_splits(axes[2])
+    axes[2].plot(years, annual['inflow_next30_median'], marker='o', linewidth=1.2, label='Annual median')
+    axes[2].plot(years, annual['inflow_next30_q90'], marker='o', linewidth=1.2, label='Annual q90')
+    axes[2].plot(years, annual['inflow_next30_q90_roll3'], linewidth=2.2, label='3-year rolling q90')
+    axes[2].set_xlabel('Year')
+    axes[2].set_ylabel('Next-30 inflow')
+    axes[2].grid(True, alpha=0.35)
+    axes[2].legend(fontsize='small', loc='upper right')
+
+    plt.tight_layout()
+    out_png = out_dir / 'environment_change_diagnostics.png'
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+    print(f"Saved: {out_png}")
+    return annual
+
+# Residual quantiles (original scale)
+def winsorize(x, p=0.005):
+    x = np.asarray(x, dtype=float)
+    lo, hi = np.quantile(x[~np.isnan(x)], [p, 1-p])
+    return np.clip(x, lo, hi)
+
+
+def month_to_season(m:int)->str:
+    m = int(m)
+    if m in (12,1,2):  return 'DJF'
+    if m in (3,4,5):   return 'MAM'
+    if m in (6,7,8):   return 'JJA'
+    return 'SON'
+
+def build_quantile_maps_raw(y_true_raw, y_pred_raw, months, min_n_month=10, min_n_season=20):
+    resid = np.asarray(y_true_raw, dtype=float) - np.asarray(y_pred_raw, dtype=float)
+    resid_w = winsorize(resid, p=0.01)
+    dfq = pd.DataFrame({
+        'm': months.values.astype(int),
+        'season': months.apply(month_to_season).values,
+        'r': resid_w
+    })
+    g_lo90, g_hi90 = np.quantile(dfq['r'].dropna(), [0.05, 0.95])
+    g_lo50, g_hi50 = np.quantile(dfq['r'].dropna(), [0.25, 0.75])
+    season_q_90 = (dfq.groupby('season')['r'].quantile([0.05, 0.95]).unstack())
+    season_q_50 = (dfq.groupby('season')['r'].quantile([0.25, 0.75]).unstack())
+    season_n = dfq.groupby('season')['r'].size()
+    month_q_90 = (dfq.groupby('m')['r'].quantile([0.05, 0.95]).unstack())
+    month_q_50 = (dfq.groupby('m')['r'].quantile([0.25, 0.75]).unstack())
+    month_n = dfq.groupby('m')['r'].size()
+
+    def blend_quantiles(month_q, month_n, season_q, season_n, g_lo, g_hi):
+        qlo_map, qhi_map = {}, {}
+        for m in sorted(dfq['m'].unique()):
+            s = month_to_season(m)
+            if m in month_q.index and month_n.get(m, 0) >= min_n_month:
+                m_lo, m_hi = float(month_q.loc[m].iloc[0]), float(month_q.loc[m].iloc[1])
+                w_m = min(1.0, month_n[m] / 30.0)
+            else:
+                m_lo, m_hi = np.nan, np.nan
+                w_m = 0.0
+            if s in season_q.index and season_n.get(s, 0) >= min_n_season:
+                s_lo, s_hi = float(season_q.loc[s].iloc[0]), float(season_q.loc[s].iloc[1])
+                w_s = 1.0 - w_m
+            else:
+                s_lo, s_hi = np.nan, np.nan
+                w_s = 0.0
+            parts_lo, parts_hi, weights = [], [], []
+            if w_m > 0 and np.isfinite(m_lo): parts_lo.append(m_lo); parts_hi.append(m_hi); weights.append(w_m)
+            if w_s > 0 and np.isfinite(s_lo): parts_lo.append(s_lo); parts_hi.append(s_hi); weights.append(w_s)
+            if len(parts_lo) == 0:
+                qlo, qhi = g_lo, g_hi
+            else:
+                w = np.array(weights, dtype=float); w = w / w.sum()
+                qlo = float(np.dot(w, np.array(parts_lo)))
+                qhi = float(np.dot(w, np.array(parts_hi)))
+            qlo_map[int(m)] = qlo
+            qhi_map[int(m)] = qhi
+        return qlo_map, qhi_map
+
+    qlo90_map, qhi90_map = blend_quantiles(month_q_90, month_n, season_q_90, season_n, g_lo90, g_hi90)
+    qlo50_map, qhi50_map = blend_quantiles(month_q_50, month_n, season_q_50, season_n, g_lo50, g_hi50)
+    return qlo90_map, qhi90_map, g_lo90, g_hi90, qlo50_map, qhi50_map, g_lo50, g_hi50
+
+def q_for_month(m, q_map, q_global):
+    return float(q_map.get(int(m), q_global))
+
+def resolve_first_existing_path(*candidates):
+    for p in candidates:
+        pp = Path(p)
+        if pp.exists():
+            return pp
+    return None
+
+def build_area_subbasin_features(rain_path: Path, sm_path: Path):
+    rain_df = pd.read_csv(rain_path)
+    sm_df = pd.read_csv(sm_path)
+
+    need_rain = {'date', 'area_m2_used', 'rain_mm_aw'}
+    need_sm = {'date', 'area_m2_used', 'sm_aw'}
+    if not need_rain.issubset(set(rain_df.columns)):
+        raise ValueError(
+            f"Subbasin rain file missing columns {sorted(need_rain)}. Found: {rain_df.columns.tolist()}"
+        )
+    if not need_sm.issubset(set(sm_df.columns)):
+        raise ValueError(
+            f"Subbasin soil-moisture file missing columns {sorted(need_sm)}. Found: {sm_df.columns.tolist()}"
+        )
+
+    rain_df['date_day'] = pd.to_datetime(rain_df['date'], errors='coerce')
+    sm_df['date_day'] = pd.to_datetime(sm_df['date'], errors='coerce')
+    rain_df['area_m2_used'] = pd.to_numeric(rain_df['area_m2_used'], errors='coerce')
+    sm_df['area_m2_used'] = pd.to_numeric(sm_df['area_m2_used'], errors='coerce')
+    rain_df['rain_mm_aw'] = pd.to_numeric(rain_df['rain_mm_aw'], errors='coerce')
+    sm_df['sm_aw'] = pd.to_numeric(sm_df['sm_aw'], errors='coerce')
+
+    def prep_long(df, value_col):
+        return (
+            df[['date_day', 'area_m2_used', value_col]]
+            .dropna(subset=['date_day', 'area_m2_used'])
+            .copy()
+        )
+
+    rain_x = prep_long(rain_df, 'rain_mm_aw')
+    sm_x = prep_long(sm_df, 'sm_aw')
+
+    canonical = pd.DataFrame(CANONICAL_SUBBASINS)
+    sb_cols = canonical['subbasin_id'].tolist()
+    validation_rows = []
+
+    def assign_canonical_subbasin(source, x, value_col):
+        area_to_basin = {}
+        for area, g in x.groupby('area_m2_used'):
+            idx = (canonical['representative_area_m2'] - area).abs().idxmin()
+            basin = canonical.loc[idx]
+            diff_pct = float(abs(basin['representative_area_m2'] - area) / area * 100.0)
+            if diff_pct > SUBBASIN_AREA_TOLERANCE_PCT:
+                raise ValueError(
+                    f"Canonical subbasin match for {source} area {area:.6f} "
+                    f"is {diff_pct:.3f}% away, above tolerance "
+                    f"{SUBBASIN_AREA_TOLERANCE_PCT:.3f}%."
+                )
+
+            area_to_basin[float(area)] = basin
+            validation_rows.append({
+                'source': source,
+                'legacy_area_m2_used': float(area),
+                'legacy_row_count': int(len(g)),
+                'legacy_value_non_null_count': int(g[value_col].notna().sum()),
+                'legacy_min_date': g['date_day'].min(),
+                'legacy_max_date': g['date_day'].max(),
+                'canonical_area_m2': float(basin['representative_area_m2']),
+                'subbasin_id': basin['subbasin_id'],
+                'reference_lon': float(basin['reference_lon']),
+                'reference_lat': float(basin['reference_lat']),
+                'area_diff_pct': diff_pct,
+            })
+
+        x['subbasin'] = x['area_m2_used'].map(lambda a: area_to_basin[float(a)]['subbasin_id'])
+        x['subbasin_id'] = x['subbasin']
+        x['centroid_lon'] = x['area_m2_used'].map(lambda a: area_to_basin[float(a)]['reference_lon'])
+        x['centroid_lat'] = x['area_m2_used'].map(lambda a: area_to_basin[float(a)]['reference_lat'])
+
+    assign_canonical_subbasin('rain', rain_x, 'rain_mm_aw')
+    assign_canonical_subbasin('soil_moisture', sm_x, 'sm_aw')
+
+    validation = pd.DataFrame(validation_rows).sort_values(['source', 'legacy_area_m2_used'])
+    validation_path = OUT_DIR / 'subbasin_area_mapping_validation.csv'
+    validation.to_csv(validation_path, index=False)
+    print(f"Saved: {validation_path}")
+    mapping_method = 'canonical_area'
+    print(f"Subbasin mapping method used: {mapping_method}")
+
+    area_weights = canonical.set_index('subbasin_id')['representative_area_m2'].reindex(sb_cols)
+    area_weights = area_weights.astype(float)
+    area_weights = area_weights / area_weights.sum()
+
+    def write_subbasin_mapping_audit(rain_x, sm_x, mapping_method):
+        audit_frames = []
+        for source, x, value_col in [
+            ('rain', rain_x, 'rain_mm_aw'),
+            ('soil_moisture', sm_x, 'sm_aw'),
+        ]:
+            tmp = x.copy()
+            tmp['source'] = source
+            tmp['value_non_null'] = tmp[value_col].notna()
+            audit_frames.append(tmp)
+
+        audit_long = pd.concat(audit_frames, ignore_index=True)
+        audit_cols = [
+            'source',
+            'subbasin',
+            'subbasin_id',
+            'centroid_lon',
+            'centroid_lat',
+            'area_m2_used',
+        ]
+        audit = (
+            audit_long
+            .groupby(audit_cols, dropna=False)
+            .agg(
+                row_count=('date_day', 'size'),
+                value_non_null_count=('value_non_null', 'sum'),
+                min_date=('date_day', 'min'),
+                max_date=('date_day', 'max'),
+            )
+            .reset_index()
+        )
+        audit.insert(0, 'mapping_method', mapping_method)
+        out_path = OUT_DIR / 'subbasin_mapping_audit.csv'
+        audit.to_csv(out_path, index=False)
+        print(f"Saved: {out_path}")
+
+    write_subbasin_mapping_audit(rain_x, sm_x, mapping_method)
+
+    rain_x = (
+        rain_x
+        .dropna(subset=['subbasin'])
+        .groupby(['date_day', 'subbasin'], as_index=False)['rain_mm_aw']
+        .mean()
+    )
+    rain_wide = (
+        rain_x.pivot_table(index='date_day', columns='subbasin', values='rain_mm_aw', aggfunc='mean')
+        .reindex(columns=sb_cols)
+        .sort_index()
+    )
+
+    sm_x = (
+        sm_x
+        .dropna(subset=['subbasin'])
+        .groupby(['date_day', 'subbasin'], as_index=False)['sm_aw']
+        .mean()
+    )
+    sm_wide = (
+        sm_x.pivot_table(index='date_day', columns='subbasin', values='sm_aw', aggfunc='mean')
+        .reindex(columns=sb_cols)
+        .sort_index()
+    )
+
+    feats = pd.DataFrame(index=rain_wide.index.union(sm_wide.index).sort_values())
+
+    for sb in sb_cols:
+        rain_s = rain_wide[sb].reindex(feats.index).astype(float).fillna(0.0)
+        sm_s = sm_wide[sb].reindex(feats.index).astype(float)
+
+        feats[f'arain_{sb}_7d'] = rain_s.rolling(7, min_periods=1).sum()
+        feats[f'arain_{sb}_30d'] = rain_s.rolling(30, min_periods=1).sum()
+        feats[f'asm_{sb}_7d'] = sm_s.rolling(7, min_periods=1).mean()
+        feats[f'asm_{sb}_30d'] = sm_s.rolling(30, min_periods=1).mean()
+
+    rain_7d_cols = [f'arain_{sb}_7d' for sb in sb_cols]
+    rain_30d_cols = [f'arain_{sb}_30d' for sb in sb_cols]
+    sm_7d_cols = [f'asm_{sb}_7d' for sb in sb_cols]
+    sm_30d_cols = [f'asm_{sb}_30d' for sb in sb_cols]
+
+    feats['arain_weighted_7d'] = feats[rain_7d_cols].mul(area_weights, axis=1).sum(axis=1)
+    feats['arain_weighted_30d'] = feats[rain_30d_cols].mul(area_weights, axis=1).sum(axis=1)
+    feats['asm_weighted_7d'] = feats[sm_7d_cols].mul(area_weights, axis=1).sum(axis=1)
+    feats['asm_weighted_30d'] = feats[sm_30d_cols].mul(area_weights, axis=1).sum(axis=1)
+    feats['arain_spread_7d'] = feats[rain_7d_cols].std(axis=1)
+    feats['asm_spread_30d'] = feats[sm_30d_cols].std(axis=1)
+
+    feature_cols = rain_7d_cols + rain_30d_cols + sm_7d_cols + sm_30d_cols + [
+        'arain_weighted_7d',
+        'arain_weighted_30d',
+        'asm_weighted_7d',
+        'asm_weighted_30d',
+        'arain_spread_7d',
+        'asm_spread_30d',
+    ]
+
+    feats = feats.reset_index().rename(columns={'index': 'date_day'})
+    return feats, feature_cols, sb_cols
+
+# ---------------- LOAD & CLEAN ----------------
+df = pd.read_csv(DATA_PATH)
+
+# Map month strings to ints if needed
+month_map = {'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,
+             'JUL':7,'AUG':8,'SEP':9,'OCT':10,'NOV':11,'DEC':12}
+if df[COL_MONTH].dtype == object:
+    df[COL_MONTH] = df[COL_MONTH].map(month_map).astype(int)
+
+need = [COL_YEAR, COL_MONTH, COL_DAY, COL_INFLOW, COL_RAIN_DAM, COL_RAIN_BSN]
+df = df[need].copy().sort_values([COL_YEAR, COL_MONTH, COL_DAY])
+
+# --- Daily dataframe prep (for next-30-day model) ---
+df_daily = df.copy()
+df_daily['date_day'] = pd.to_datetime(
+    dict(year=df_daily[COL_YEAR], month=df_daily[COL_MONTH], day=df_daily[COL_DAY]),
+    errors='coerce'
+)
+df_daily = df_daily.dropna(subset=['date_day']).sort_values('date_day')
+
+# DAILY -> NEXT-30-DAY INFLOW MODEL (rolling-window features)
+
+print("\n===== DAILY NEXT-30-DAY INFLOW MODEL =====")
+
+# 1. Build / clean daily dataframe (df_daily already exists)
+daily = df_daily.copy().sort_values('date_day').reset_index(drop=True)
+
+# plot daily inflow time series (raw + 30-day running sum) and save to OUT_DIR
+daily['date_day'] = pd.to_datetime(daily['date_day'])
+daily['year'] = daily['date_day'].dt.year
+daily['split'], validation_split_meta = assign_validation_splits(daily[['date_day', 'year']])
+daily['inflow_raw_plot'] = pd.to_numeric(daily[COL_INFLOW], errors='coerce').fillna(0.0)
+
+plt.figure(figsize=(12,5))
+ax = plt.gca()
+
+split_handles = shade_split_spans(ax, daily[['date_day', 'split']])
+
+# plot series on top
+l1, = ax.plot(daily['date_day'], daily['inflow_raw_plot'], color='tab:red', alpha=0.6, label='Daily inflow')
+
+if normalize_validation_mode(VALIDATION_MODE) == 'chronological':
+    boundary_pretrain_to_train = pd.Timestamp(year=TRAIN_START, month=1, day=1)
+    boundary_train_to_val = pd.Timestamp(year=TRAIN_END + 1, month=1, day=1)
+    boundary_val_to_test  = pd.Timestamp(year=VAL_END + 1,   month=1, day=1)
+    if daily['date_day'].min() < boundary_pretrain_to_train:
+        ax.axvline(boundary_pretrain_to_train, color='0.5', linestyle='--', linewidth=1.0)
+    ax.axvline(boundary_train_to_val, color='tab:green', linestyle='--', linewidth=1.0)
+    ax.axvline(boundary_val_to_test,  color='tab:orange', linestyle='--', linewidth=1.0)
+
+ax.set_xlabel('Date'); ax.set_ylabel('Inflow'); ax.set_title(f"Daily inflow time series ({VALIDATION_MODE} validation)")
+ax.grid(True)
+legend_handles = split_handles + [l1]
+ax.legend(handles=legend_handles, fontsize='small', loc='upper right')
+plt.tight_layout()
+
+outf = OUT_DIR / 'daily_inflow_timeseries.png'
+plt.savefig(outf, dpi=150); plt.close()
+print(f"Saved: {outf}")
+
+# Make sure inflow is float
+daily[COL_INFLOW] = daily[COL_INFLOW].astype(float)
+daily[COL_RAIN_DAM] = pd.to_numeric(daily[COL_RAIN_DAM], errors='coerce').fillna(0.0)
+daily[COL_RAIN_BSN] = pd.to_numeric(daily[COL_RAIN_BSN], errors='coerce').fillna(0.0)
+daily['rainfall_altu_combined'] = daily[COL_RAIN_DAM] + daily[COL_RAIN_BSN]
+
+# 2a. Merge in area-weighted subbasin rain/soil features
+sub_rain_path = resolve_first_existing_path(
+    SUBBASIN_RAIN_PATH,
+    Path(r"C:\Users\aalec\Desktop\Altus Project\ERA5Land_daily_area_weighted_subbasin_rainfall.csv")
+)
+sub_sm_path = resolve_first_existing_path(
+    SUBBASIN_SM_PATH,
+    Path(r"C:\Users\aalec\Desktop\Altus Project\ERA5Land_daily_area_weighted_subbasin_soil_moisture.csv")
+)
+if sub_rain_path is None or sub_sm_path is None:
+    raise FileNotFoundError(
+        "Could not find subbasin rain/soil files. "
+        f"Rain path tried: {SUBBASIN_RAIN_PATH} and desktop fallback; "
+        f"Soil path tried: {SUBBASIN_SM_PATH} and desktop fallback."
+    )
+
+sub_feats, sub_feature_cols, subbasins_found = build_area_subbasin_features(sub_rain_path, sub_sm_path)
+daily = daily.merge(sub_feats, on='date_day', how='left')
+print(f"Added area-specific features from {len(subbasins_found)} subbasins: {subbasins_found}")
+
+
+# 3. Base lag feature
+qin = daily[COL_INFLOW].astype(float).fillna(0.0)
+qin_prior = qin.shift(1)
+daily['qin_30d'] = qin_prior.rolling(30, min_periods=1).sum()
+daily['qin_90d'] = qin_prior.rolling(90, min_periods=1).sum()
+daily['qin_180d'] = qin_prior.rolling(180, min_periods=1).sum()
+daily['qin_365d'] = qin_prior.rolling(365, min_periods=1).sum()
+
+qin30_history = daily['qin_30d']
+daily['qin_30d_std_365d'] = qin30_history.rolling(365, min_periods=30).std()
+daily['qin_30d_iqr_365d'] = (
+    qin30_history.rolling(365, min_periods=30).quantile(0.75)
+    - qin30_history.rolling(365, min_periods=30).quantile(0.25)
+)
+daily['qin_30d_q90_365d'] = qin30_history.rolling(365, min_periods=30).quantile(0.90)
+
+train_qin30 = daily.loc[
+    daily['split'] == 'train',
+    'qin_30d'
+].dropna()
+if train_qin30.empty:
+    raise ValueError(
+        "No training-period qin_30d rows available for high_qin30_rate_365d. "
+        "Check TRAIN_START / TRAIN_END, VALIDATION_MODE, and inflow coverage."
+    )
+high_qin30_threshold_train = float(np.quantile(train_qin30, HIGH_QIN30_QUANTILE))
+daily['high_qin30_rate_365d'] = (
+    (qin30_history >= high_qin30_threshold_train)
+    .astype(float)
+    .rolling(365, min_periods=30)
+    .mean()
+)
+print(
+    f"High qin_30d threshold (q={HIGH_QIN30_QUANTILE:.2f}) from train: "
+    f"{high_qin30_threshold_train:.2f}"
+)
+
+rainfall_altu_feature_cols = []
+rainfall_sources = {
+    #'rain_altu_dam': daily[COL_RAIN_DAM],
+    #'rain_altu_bsn': daily[COL_RAIN_BSN],
+    #'rain_altu_combined': daily['rainfall_altu_combined'],
+}
+for rain_name, rain_series in rainfall_sources.items():
+    rain_series = rain_series.astype(float).fillna(0.0)
+    for window in RAINFALL_ROLLING_WINDOWS:
+        feature_col = f'{rain_name}_{window}d'
+        daily[feature_col] = rain_series.rolling(window, min_periods=1).sum()
+        rainfall_altu_feature_cols.append(feature_col)
+print(
+    "Added ALTU rainfall rolling features: "
+    f"{len(rainfall_altu_feature_cols)} columns from windows {RAINFALL_ROLLING_WINDOWS}"
+)
+
+# Seasonality features (day of year)
+daily['doy']     = daily['date_day'].dt.dayofyear
+daily['doy_sin'] = np.sin(2*np.pi*daily['doy']/365.25)
+daily['doy_cos'] = np.cos(2*np.pi*daily['doy']/365.25)
+
+# 4. Target: sum of inflow over the NEXT 30 days (rolling window)
+#
+# inflow_next30(t) = sum of inflow from t+1 to t+30
+daily['inflow_next30'] = (
+    qin.shift(-30)  # shift back 30 days to get future inflow
+       .rolling(30, min_periods=30)
+       .sum()
+)
+
+daily['inflow_next30_log'] = np.log1p(daily['inflow_next30'])
+
+# 5. Build modeling dataframe
+
+daily_features = [
+    'qin_30d',
+    #'qin_90d',
+    #'qin_180d',
+    'qin_365d',
+    #'qin_30d_std_365d',
+    #'qin_30d_iqr_365d',
+    #'qin_30d_q90_365d',
+    #'high_qin30_rate_365d',
+    'doy_sin',
+    'doy_cos'
+]
+daily_features += rainfall_altu_feature_cols
+# Editable subbasin feature list (remove any items you want to test without)
+SELECTED_SUBBASIN_FEATURES = [
+    #'arain_SB_SW_7d',
+    #'arain_SB_M_7d',
+    #'arain_SB_SE_7d',
+    #'arain_SB_NW_7d',
+    #'arain_SB_SW_30d',
+    #'arain_SB_M_30d',
+    #'arain_SB_SE_30d',
+    #'arain_SB_NW_30d',
+    #'asm_SB_SW_7d',
+    #'asm_SB_M_7d',
+    #'asm_SB_SE_7d',
+    #'asm_SB_NW_7d',
+    #'asm_SB_SW_30d',
+    #'asm_SB_M_30d',
+    #'asm_SB_SE_30d',
+    #'asm_SB_NW_30d',
+    #'arain_weighted_7d',
+    #'arain_weighted_30d',
+    #'asm_weighted_7d',
+    #'asm_weighted_30d',
+    #'arain_spread_7d',
+    #'asm_spread_30d',
+]
+
+
+available_sub_features = set(sub_feature_cols)
+selected_sub_features = [f for f in SELECTED_SUBBASIN_FEATURES if f in available_sub_features]
+
+#daily_features += selected_sub_features
+
+baseline_feature_cols = [
+    col for col in ['qin_30d', 'qin_90d', 'qin_180d', 'qin_365d']
+    if col in daily.columns
+]
+diagnostic_feature_cols = list(dict.fromkeys(daily_features + baseline_feature_cols))
+model_cols = ['date_day','year','split'] + diagnostic_feature_cols + ['inflow_next30','inflow_next30_log']
+daily_model_input_df = daily[model_cols].copy()
+
+retention_rows = []
+for split_name, g in daily_model_input_df.groupby('split', dropna=False):
+    feature_complete = g[daily_features].notna().all(axis=1)
+    target_complete = g[['inflow_next30','inflow_next30_log']].notna().all(axis=1)
+    model_complete = g[['date_day','year'] + daily_features + ['inflow_next30','inflow_next30_log']].notna().all(axis=1)
+    retention_rows.append({
+        'split': split_name,
+        'rows_before_dropna': int(len(g)),
+        'rows_with_complete_selected_features': int(feature_complete.sum()),
+        'rows_with_complete_target': int(target_complete.sum()),
+        'rows_after_dropna': int(model_complete.sum()),
+        'rows_dropped': int((~model_complete).sum()),
+        'pct_rows_after_dropna': float(model_complete.mean() * 100.0) if len(g) else np.nan,
+    })
+
+retention_df = pd.DataFrame(retention_rows).sort_values('split')
+retention_path = OUT_DIR / 'daily_model_row_retention_by_split.csv'
+retention_df.to_csv(retention_path, index=False)
+print(f"Saved: {retention_path}")
+
+missing_rows = []
+for split_name, g in daily_model_input_df.groupby('split', dropna=False):
+    for col in daily_features + ['inflow_next30','inflow_next30_log']:
+        non_null = int(g[col].notna().sum())
+        missing_rows.append({
+            'split': split_name,
+            'column': col,
+            'non_null_rows': non_null,
+            'missing_rows': int(len(g) - non_null),
+            'pct_non_null': float((non_null / len(g)) * 100.0) if len(g) else np.nan,
+        })
+
+missing_df = pd.DataFrame(missing_rows).sort_values(['split', 'column'])
+missing_path = OUT_DIR / 'daily_model_missingness_by_split.csv'
+missing_df.to_csv(missing_path, index=False)
+print(f"Saved: {missing_path}")
+
+daily_model_df = daily_model_input_df[model_cols].dropna().reset_index(drop=True)
+validation_split_summary_df = save_split_summary(daily_model_df, validation_split_meta, out_dir=OUT_DIR)
+
+# 6. Validation-mode split
+
+train_d = daily_model_df[daily_model_df['split'] == 'train'].copy()
+val_d   = daily_model_df[daily_model_df['split'] == 'val'].copy()
+test_d  = daily_model_df[daily_model_df['split'] == 'test'].copy()
+
+print(
+    "Daily model rows after feature/target cleanup: "
+    f"train={len(train_d)}, "
+    f"val={len(val_d)}, "
+    f"test={len(test_d)} (> {VAL_END})"
+)
+if train_d.empty:
+    raise ValueError(
+        "No daily training rows survived feature/target cleanup. "
+        "Check date coverage and missing values in the selected model features."
+    )
+if val_d.empty:
+    raise ValueError(
+        "No daily validation rows survived feature/target cleanup. "
+        "Check VALIDATION_MODE, date coverage, and missing values in the selected model features."
+    )
+
+Xd_tr, Xd_v, Xd_t = train_d[daily_features], val_d[daily_features], test_d[daily_features]
+yd_tr_raw, yd_v_raw, yd_t_raw = train_d['inflow_next30'], val_d['inflow_next30'], test_d['inflow_next30']
+yd_tr_log, yd_v_log, yd_t_log = train_d['inflow_next30_log'], val_d['inflow_next30_log'], test_d['inflow_next30_log']
+
+# Flood/event thresholds derived from TRAIN only (prevents leakage)
+flood_threshold_train = float(np.quantile(yd_tr_raw, FLOOD_QUANTILE))
+event_threshold_train = float(np.quantile(yd_tr_raw, EVENT_QUANTILE))
+print(f"Flood threshold (q={FLOOD_QUANTILE:.2f}) from train: {flood_threshold_train:.2f}")
+print(f"Event threshold (q={EVENT_QUANTILE:.2f}) from train: {event_threshold_train:.2f}")
+
+environment_diagnostics_df = build_environment_change_diagnostics(
+    daily,
+    event_threshold=event_threshold_train,
+    flood_threshold=flood_threshold_train,
+    out_dir=OUT_DIR,
+)
+
+# 7. Impute features (shared across models)
+
+imp_d = SimpleImputer(strategy='mean')
+Xd_tr_i = imp_d.fit_transform(Xd_tr)
+Xd_v_i  = imp_d.transform(Xd_v)
+Xd_t_i  = imp_d.transform(Xd_t)
+
+metrics_d = {}
+preds_train = {}
+preds_val   = {}
+preds_test  = {}
+feature_importance_models = {}
+permutation_importance_predictors = {}
+
+# 7a. Linear Regression (log target)
+lin_d = LinearRegression()
+lin_d.fit(Xd_tr_i, yd_tr_log)
+feature_importance_models['Linear_DailyNext30'] = lin_d
+permutation_importance_predictors['Linear_DailyNext30'] = lambda X, model=lin_d: np.expm1(model.predict(X))
+
+m_tr_lin, pred_tr_lin = eval_model_log('Linear_DailyNext30', lin_d, Xd_tr_i, yd_tr_raw)
+m_v_lin,  pred_v_lin  = eval_model_log('Linear_DailyNext30', lin_d, Xd_v_i,  yd_v_raw)
+m_t_lin,  pred_t_lin  = eval_model_log('Linear_DailyNext30', lin_d, Xd_t_i,  yd_t_raw)
+
+metrics_d['Linear_DailyNext30'] = [
+    dict(split='train', **m_tr_lin),
+    dict(split='val',   **m_v_lin),
+    dict(split='test',  **m_t_lin),
+]
+preds_train['Linear_DailyNext30'] = pred_tr_lin
+preds_val['Linear_DailyNext30']   = pred_v_lin
+preds_test['Linear_DailyNext30']  = pred_t_lin
+
+# 7b. Ridge Regression (log target)
+ridge_d = Ridge(alpha=1.0, random_state=0)
+ridge_d.fit(Xd_tr_i, yd_tr_log)
+feature_importance_models['Ridge_DailyNext30'] = ridge_d
+permutation_importance_predictors['Ridge_DailyNext30'] = lambda X, model=ridge_d: np.expm1(model.predict(X))
+
+# use daily splits/targets (fixed variable mix-up was causing the shape error)
+m_tr_ridge, pred_tr_ridge = eval_model_log('Ridge_DailyNext30', ridge_d, Xd_tr_i, yd_tr_raw)
+m_v_ridge,  pred_v_ridge  = eval_model_log('Ridge_DailyNext30', ridge_d, Xd_v_i,  yd_v_raw)
+m_t_ridge,  pred_t_ridge  = eval_model_log('Ridge_DailyNext30', ridge_d, Xd_t_i,  yd_t_raw)
+
+metrics_d['Ridge_DailyNext30'] = [
+    dict(split='train', **m_tr_ridge),
+    dict(split='val',   **m_v_ridge),
+    dict(split='test',  **m_t_ridge),
+]
+preds_train['Ridge_DailyNext30'] = pred_tr_ridge
+preds_val['Ridge_DailyNext30']   = pred_v_ridge
+preds_test['Ridge_DailyNext30']  = pred_t_ridge
+
+# 7c. RandomForest (if available)
+if RF_AVAILABLE:
+    rf_params = dict(RF_DEFAULT_PARAMS)
+    if RUN_HYPERPARAMETER_TUNING:
+        rf_candidates = build_tuning_candidates(
+            default_params=RF_DEFAULT_PARAMS,
+            fixed_grid=RF_TUNING_GRID,
+            param_distributions=RF_TUNING_DISTRIBUTIONS,
+            n_iter=RF_RANDOM_SEARCH_ITER,
+            random_state=TUNING_RANDOM_STATE,
+            mode=TUNING_MODE,
+        )
+        rf_params, rf_tuning_df = tune_log_target_regressor(
+            'RF_DailyNext30',
+            model_factory=lambda params: RandomForestRegressor(**params),
+            param_candidates=rf_candidates,
+            X_tr_i=Xd_tr_i,
+            y_tr_log=yd_tr_log,
+            y_tr_raw=yd_tr_raw,
+            X_v_i=Xd_v_i,
+            y_v_raw=yd_v_raw,
+            selection_metric=TUNING_SELECTION_METRIC,
+            gap_penalty=TUNING_GAP_PENALTY,
+            out_dir=OUT_DIR,
+        )
+
+    # Baseline RF
+    rf_d = RandomForestRegressor(**rf_params)
+    rf_d.fit(Xd_tr_i, yd_tr_log)
+    feature_importance_models['RF_DailyNext30'] = rf_d
+    permutation_importance_predictors['RF_DailyNext30'] = lambda X, model=rf_d: np.expm1(model.predict(X))
+
+    m_tr_rf, pred_tr_rf = eval_model_log('RF_DailyNext30', rf_d, Xd_tr_i, yd_tr_raw)
+    m_v_rf,  pred_v_rf  = eval_model_log('RF_DailyNext30', rf_d, Xd_v_i,  yd_v_raw)
+    m_t_rf,  pred_t_rf  = eval_model_log('RF_DailyNext30', rf_d, Xd_t_i,  yd_t_raw)
+
+    metrics_d['RF_DailyNext30'] = [
+        dict(split='train', **m_tr_rf),
+        dict(split='val',   **m_v_rf),
+        dict(split='test',  **m_t_rf),
+    ]
+    preds_train['RF_DailyNext30'] = pred_tr_rf
+    preds_val['RF_DailyNext30']   = pred_v_rf
+    preds_test['RF_DailyNext30']  = pred_t_rf
+
+# 7d. XGBoost (if available)
+if XGB_AVAILABLE:
+    xgb_params = dict(XGB_DEFAULT_PARAMS)
+    if RUN_HYPERPARAMETER_TUNING:
+        xgb_candidates = build_tuning_candidates(
+            default_params=XGB_DEFAULT_PARAMS,
+            fixed_grid=XGB_TUNING_GRID,
+            param_distributions=XGB_TUNING_DISTRIBUTIONS,
+            n_iter=XGB_RANDOM_SEARCH_ITER,
+            random_state=TUNING_RANDOM_STATE + 1,
+            mode=TUNING_MODE,
+        )
+        xgb_params, xgb_tuning_df = tune_log_target_regressor(
+            'XGB_DailyNext30',
+            model_factory=lambda params: xgb.XGBRegressor(**params),
+            param_candidates=xgb_candidates,
+            X_tr_i=Xd_tr_i,
+            y_tr_log=yd_tr_log,
+            y_tr_raw=yd_tr_raw,
+            X_v_i=Xd_v_i,
+            y_v_raw=yd_v_raw,
+            selection_metric=TUNING_SELECTION_METRIC,
+            gap_penalty=TUNING_GAP_PENALTY,
+            out_dir=OUT_DIR,
+        )
+
+    xgb_d = xgb.XGBRegressor(**xgb_params)
+
+    xgb_d.fit(Xd_tr_i, yd_tr_log)
+    feature_importance_models['XGB_DailyNext30'] = xgb_d
+    permutation_importance_predictors['XGB_DailyNext30'] = lambda X, model=xgb_d: np.expm1(model.predict(X))
+
+    m_tr_xgb, pred_tr_xgb = eval_model_log('XGB_DailyNext30', xgb_d, Xd_tr_i, yd_tr_raw)
+    m_v_xgb,  pred_v_xgb  = eval_model_log('XGB_DailyNext30', xgb_d, Xd_v_i,  yd_v_raw)
+    m_t_xgb,  pred_t_xgb  = eval_model_log('XGB_DailyNext30', xgb_d, Xd_t_i,  yd_t_raw)
+
+    metrics_d['XGB_DailyNext30'] = [
+        dict(split='train', **m_tr_xgb),
+        dict(split='val',   **m_v_xgb),
+        dict(split='test',  **m_t_xgb),
+    ]
+    preds_train['XGB_DailyNext30'] = pred_tr_xgb
+    preds_val['XGB_DailyNext30']   = pred_v_xgb
+    preds_test['XGB_DailyNext30']  = pred_t_xgb
+
+# 8. Collect metrics into a single DataFrame
+rows = []
+for name, mlist in metrics_d.items():
+    for m in mlist:
+        m = m.copy()
+        m['name'] = name
+        rows.append(m)
+
+metrics_daily_df = pd.DataFrame(rows).sort_values(['split','RMSE','name'])
+print("\n=== DAILY NEXT-30D METRICS (lower is better) ===")
+print(metrics_daily_df)
+
+metrics_daily_df.to_csv(OUT_DIR / "metrics_daily_next30.csv", index=False)
+
+baseline_metrics_df = evaluate_baselines(
+    train_d,
+    {'train': train_d, 'val': val_d, 'test': test_d},
+    flood_threshold=flood_threshold_train,
+    event_threshold=event_threshold_train,
+    out_dir=OUT_DIR,
+)
+model_metrics_for_compare = metrics_daily_df.copy()
+model_metrics_for_compare['kind'] = 'model'
+baseline_metrics_for_compare = baseline_metrics_df.copy()
+metrics_with_baselines_df = (
+    pd.concat([model_metrics_for_compare, baseline_metrics_for_compare], ignore_index=True, sort=False)
+    .sort_values(['split', 'MAE', 'kind', 'name'])
+)
+metrics_with_baselines_path = OUT_DIR / 'metrics_daily_next30_with_baselines.csv'
+metrics_with_baselines_df.to_csv(metrics_with_baselines_path, index=False)
+print(f"Saved: {metrics_with_baselines_path}")
+
+# 9. Choose best model (forced model or validation-based auto-selection)
+if FORCE_BEST_MODEL is not None:
+    if FORCE_BEST_MODEL not in preds_val:
+        raise ValueError(f"FORCE_BEST_MODEL '{FORCE_BEST_MODEL}' not found in trained models: {list(preds_val.keys())}")
+    best_name = FORCE_BEST_MODEL
+    print(f"\nBest daily next-30d model forced by config: {best_name}")
+else:
+    val_metrics = metrics_daily_df[metrics_daily_df['split'] == 'val'].copy()
+    if MODEL_SELECTION_METRIC in val_metrics.columns and val_metrics[MODEL_SELECTION_METRIC].notna().any():
+        val_metrics = val_metrics.sort_values([MODEL_SELECTION_METRIC, 'MAE', 'RMSE'])
+        best_name = val_metrics.iloc[0]['name']
+        print(f"\nBest daily next-30d model on val ({MODEL_SELECTION_METRIC}): {best_name}")
+    else:
+        val_metrics = val_metrics.sort_values(['MAE', 'RMSE'])
+        best_name = val_metrics.iloc[0]['name']
+        print(f"\nBest daily next-30d model on val (MAE fallback): {best_name}")
+
+feature_importance_out = save_feature_importance_outputs(
+    feature_importance_models,
+    feature_names=daily_features,
+    best_model_name=best_name,
+    out_dir=OUT_DIR,
+)
+
+permutation_importance_out = save_permutation_importance_outputs(
+    permutation_importance_predictors,
+    X_i=Xd_v_i,
+    y_true_raw=yd_v_raw,
+    feature_names=daily_features,
+    best_model_name=best_name,
+    out_dir=OUT_DIR,
+    n_repeats=PERMUTATION_IMPORTANCE_REPEATS,
+)
+
+# 10. Build residual-based uncertainty bands using VALIDATION set
+#     (same logic as monthly CIs, but with daily-origin month)
+
+y_true_val = yd_v_raw.values
+y_pred_val = preds_val[best_name]
+months_val = val_d['date_day'].dt.month
+
+qlo90_map, qhi90_map, glo90, ghi90, qlo50_map, qhi50_map, glo50, ghi50 = build_quantile_maps_raw(
+    y_true_raw=y_true_val,
+    y_pred_raw=y_pred_val,
+    months=months_val,
+    min_n_month=10,
+    min_n_season=20
+)
+
+# Apply month-conditioned residual quantiles to TEST predictions
+months_test = test_d['date_day'].dt.month
+qlo90 = months_test.apply(lambda m: q_for_month(m, qlo90_map, glo90)).to_numpy()
+qhi90 = months_test.apply(lambda m: q_for_month(m, qhi90_map, ghi90)).to_numpy()
+qlo50 = months_test.apply(lambda m: q_for_month(m, qlo50_map, glo50)).to_numpy()
+qhi50 = months_test.apply(lambda m: q_for_month(m, qhi50_map, ghi50)).to_numpy()
+
+# Build test output with CIs
+test_daily_out = test_d[['date_day']].copy()
+test_daily_out['y_true_next30'] = yd_t_raw.values
+test_daily_out['y_pred_next30'] = preds_test[best_name]
+
+test_daily_out['y_lo90'] = test_daily_out['y_pred_next30'] + qlo90
+test_daily_out['y_hi90'] = test_daily_out['y_pred_next30'] + qhi90
+test_daily_out['y_lo50'] = test_daily_out['y_pred_next30'] + qlo50
+test_daily_out['y_hi50'] = test_daily_out['y_pred_next30'] + qhi50
+
+# Save raw test predictions + CIs
+test_daily_out_sorted = test_daily_out.sort_values('date_day')
+test_daily_out_sorted.to_csv(OUT_DIR / "predictions_daily_next30_with_ci.csv", index=False)
+
+# Monthly issuance slice (parallel to daily): issue on day ISSUE_DAY_OF_MONTH each month
+test_monthly_issue = test_daily_out_sorted[test_daily_out_sorted['date_day'].dt.day == ISSUE_DAY_OF_MONTH].copy()
+test_monthly_issue.to_csv(OUT_DIR / f"predictions_monthly_issue_day{ISSUE_DAY_OF_MONTH}_next30_with_ci.csv", index=False)
+
+# Cadence metrics side-by-side (daily_all vs monthly_dayX)
+cadence_rows = []
+for cadence_name, cdf in [
+    ('daily_all', test_daily_out_sorted),
+    (f'monthly_day{ISSUE_DAY_OF_MONTH}', test_monthly_issue),
+]:
+    if len(cdf) == 0:
+        continue
+    y_true_c = cdf['y_true_next30'].to_numpy()
+    y_pred_c = cdf['y_pred_next30'].to_numpy()
+    m = extra_metrics(y_true_c, y_pred_c)
+    m.update(flood_focus_metrics(y_true_c, y_pred_c, flood_threshold=flood_threshold_train, event_threshold=event_threshold_train))
+    m['cadence'] = cadence_name
+    m['n'] = int(len(cdf))
+    m['model'] = best_name
+    cadence_rows.append(m)
+
+cadence_metrics_df = pd.DataFrame(cadence_rows)
+if len(cadence_metrics_df) > 0:
+    cadence_metrics_df.to_csv(OUT_DIR / "metrics_issue_cadence_next30.csv", index=False)
+    print("\n=== ISSUE CADENCE METRICS (best model) ===")
+    print(cadence_metrics_df)
+
+# 11. Plot with CI bands using existing helper (needs 'date' column)
+df_plot_90 = test_daily_out_sorted.rename(columns={
+    'date_day': 'date',
+    'y_true_next30': 'y_true',
+    'y_pred_next30': 'y_pred'
+})
+
+plot_with_ci_band(
+    df=df_plot_90,
+    actual_col='y_true',
+    pred_col='y_pred',
+    lo_col='y_lo90',
+    hi_col='y_hi90',
+    title=f'{best_name} Next 30-Day Inflow with 90% CI (Test - Daily)',
+    fname='test_timeline_daily_next30_ci90.png',
+    out_dir=OUT_DIR
+)
+
+plot_with_ci_band(
+    df=df_plot_90,
+    actual_col='y_true',
+    pred_col='y_pred',
+    lo_col='y_lo50',
+    hi_col='y_hi50',
+    title=f'{best_name} Next 30-Day Inflow with 50% CI (Test - Daily)',
+    fname='test_timeline_daily_next30_ci50.png',
+    out_dir=OUT_DIR
+)
+
+if len(test_monthly_issue) > 0:
+    df_plot_monthly = test_monthly_issue.rename(columns={
+        'date_day': 'date',
+        'y_true_next30': 'y_true',
+        'y_pred_next30': 'y_pred'
+    })
+
+    plot_with_ci_band(
+        df=df_plot_monthly,
+        actual_col='y_true',
+        pred_col='y_pred',
+        lo_col='y_lo90',
+        hi_col='y_hi90',
+        title=f'{best_name} Next 30-Day Inflow with 90% CI (Test - Monthly Day {ISSUE_DAY_OF_MONTH})',
+        fname=f'test_timeline_monthly_day{ISSUE_DAY_OF_MONTH}_next30_ci90.png',
+        out_dir=OUT_DIR
+    )
+
+    plot_with_ci_band(
+        df=df_plot_monthly,
+        actual_col='y_true',
+        pred_col='y_pred',
+        lo_col='y_lo50',
+        hi_col='y_hi50',
+        title=f'{best_name} Next 30-Day Inflow with 50% CI (Test - Monthly Day {ISSUE_DAY_OF_MONTH})',
+        fname=f'test_timeline_monthly_day{ISSUE_DAY_OF_MONTH}_next30_ci50.png',
+        out_dir=OUT_DIR
+    )
+
+print(f"Saved: predictions_daily_next30_with_ci.csv")
+print(f"Saved: predictions_monthly_issue_day{ISSUE_DAY_OF_MONTH}_next30_with_ci.csv")
+print("Saved: metrics_issue_cadence_next30.csv")
+
+# --- Plot RandomForest Actual vs Predicted (daily only) ---
+if RF_AVAILABLE:
+
+    # Daily next-30d test (if RF produced daily preds stored in preds_test) - line plot over daily test period
+    if 'RF_DailyNext30' in preds_test and preds_test['RF_DailyNext30'] is not None:
+        # build dataframe aligned to test_d dates
+        df_rf_daily = test_d[['date_day']].copy().reset_index(drop=True)
+        df_rf_daily['y_true_next30'] = yd_t_raw.values
+        df_rf_daily['y_pred_next30'] = preds_test['RF_DailyNext30']
+        df_rf_daily = df_rf_daily.sort_values('date_day').reset_index(drop=True)
+
+        plt.figure(figsize=(12,5))
+        plt.plot(df_rf_daily['date_day'], df_rf_daily['y_true_next30'], label='Actual Next-30d', linewidth=1.8)
+        plt.plot(df_rf_daily['date_day'], df_rf_daily['y_pred_next30'], label='RF Predicted Next-30d', linewidth=1.2)
+        plt.xlabel('Date'); plt.ylabel('Next-30d Inflow'); plt.title('RandomForest: Actual vs Predicted (Daily Next-30 Test)')
+        plt.grid(True); plt.legend(); plt.tight_layout()
+        outfile2 = OUT_DIR / 'rf_line_actual_vs_pred_daily_next30.png'
+        plt.savefig(outfile2, dpi=150); plt.close()
+        print(f"Saved: {outfile2}")
+
+# ---- Combined Actual vs Models (Daily Next-30 Test): Linear, RandomForest, XGBoost ----
+df_daily_models = test_d[['date_day']].copy().reset_index(drop=True)
+df_daily_models['y_true'] = yd_t_raw.values
+
+# add model preds if present in preds_test
+if 'Linear_DailyNext30' in preds_test and preds_test['Linear_DailyNext30'] is not None:
+    df_daily_models['y_lin'] = preds_test['Linear_DailyNext30']
+if 'RF_DailyNext30' in preds_test and preds_test['RF_DailyNext30'] is not None:
+    df_daily_models['y_rf'] = preds_test['RF_DailyNext30']
+if 'XGB_DailyNext30' in preds_test and preds_test['XGB_DailyNext30'] is not None:
+    df_daily_models['y_xgb'] = preds_test['XGB_DailyNext30']
+
+# Only proceed if at least one model column exists
+model_cols = [c for c in ['y_lin','y_rf','y_xgb'] if c in df_daily_models.columns]
+if len(model_cols) > 0:
+    df_daily_models = df_daily_models.sort_values('date_day').reset_index(drop=True)
+    plt.figure(figsize=(12,5))
+    plt.plot(df_daily_models['date_day'], df_daily_models['y_true'], label='Actual Next-30d', linewidth=2.0, color='k')
+    if 'y_lin' in df_daily_models:
+        plt.plot(df_daily_models['date_day'], df_daily_models['y_lin'], label='Linear', color='tab:orange', linewidth=1.2)
+    if 'y_rf' in df_daily_models:
+        plt.plot(df_daily_models['date_day'], df_daily_models['y_rf'], label='RandomForest', color='tab:green', linewidth=1.2)
+    if 'y_xgb' in df_daily_models:
+        plt.plot(df_daily_models['date_day'], df_daily_models['y_xgb'], label='XGBoost', color='tab:blue', linewidth=1.2)
+    plt.xlabel('Date'); plt.ylabel('Next-30d Inflow'); plt.title('Actual vs Model Predictions (Daily Next-30 Test)')
+    plt.grid(True); plt.legend(); plt.tight_layout()
+    out_daily_combined = OUT_DIR / 'models_actual_daily_next30_test.png'
+    plt.savefig(out_daily_combined, dpi=150); plt.close()
+    print(f"Saved: {out_daily_combined}")
+else:
+    print("Skipping daily combined model plot: no daily model predictions found in preds_test.")
