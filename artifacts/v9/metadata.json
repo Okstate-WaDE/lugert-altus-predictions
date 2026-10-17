@@ -1,0 +1,227 @@
+{
+  "schema_version": 1,
+  "model_version": "v9",
+  "best_model_name": "RF_DailyNext30",
+  "feature_columns": [
+    "qin_30d",
+    "qin_90d",
+    "qin_180d",
+    "doy_sin",
+    "doy_cos",
+    "arain_SB_SW_7d",
+    "arain_SB_M_7d",
+    "arain_SB_NW_7d",
+    "arain_SB_SW_30d",
+    "arain_SB_NW_30d",
+    "asm_SB_SW_7d",
+    "asm_SB_M_7d",
+    "asm_SB_SE_7d",
+    "asm_SB_NW_7d",
+    "asm_SB_SW_30d",
+    "asm_SB_M_30d",
+    "asm_SB_SE_30d",
+    "asm_SB_NW_30d",
+    "arain_spread_7d",
+    "asm_spread_30d"
+  ],
+  "feature_config": {
+    "feature_columns": [
+      "qin_30d",
+      "qin_90d",
+      "qin_180d",
+      "doy_sin",
+      "doy_cos",
+      "arain_SB_SW_7d",
+      "arain_SB_M_7d",
+      "arain_SB_NW_7d",
+      "arain_SB_SW_30d",
+      "arain_SB_NW_30d",
+      "asm_SB_SW_7d",
+      "asm_SB_M_7d",
+      "asm_SB_SE_7d",
+      "asm_SB_NW_7d",
+      "asm_SB_SW_30d",
+      "asm_SB_M_30d",
+      "asm_SB_SE_30d",
+      "asm_SB_NW_30d",
+      "arain_spread_7d",
+      "asm_spread_30d"
+    ],
+    "canonical_subbasins": [
+      {
+        "subbasin_id": "SB_SW",
+        "representative_area_m2": 878470000.0,
+        "reference_lon": -100.2800817,
+        "reference_lat": 35.3272738
+      },
+      {
+        "subbasin_id": "SB_M",
+        "representative_area_m2": 937450000.0,
+        "reference_lon": -99.8063283,
+        "reference_lat": 35.3290272
+      },
+      {
+        "subbasin_id": "SB_SE",
+        "representative_area_m2": 1064410000.0,
+        "reference_lon": -99.5099193,
+        "reference_lat": 35.1724732
+      },
+      {
+        "subbasin_id": "SB_NW",
+        "representative_area_m2": 1405090000.0,
+        "reference_lon": -100.1718715,
+        "reference_lat": 35.4996085
+      }
+    ],
+    "subbasin_area_tolerance_pct": 2.0,
+    "rainfall_rolling_windows": [
+      7,
+      14,
+      30,
+      45
+    ],
+    "high_qin30_threshold_train": 4572.5
+  },
+  "prediction_kind": "log_regressor",
+  "intervals": {
+    "qlo90_map": {
+      "1": -759.0564777089262,
+      "2": -2295.053573076351,
+      "3": -1993.5752134783088,
+      "4": -224.42668130534378,
+      "5": -1142.7569910586183,
+      "6": -1174.8439028445173,
+      "7": -690.4146550955695,
+      "8": -435.743111264153,
+      "9": -491.23319679095306,
+      "10": 476.3737042291404,
+      "11": -1741.9342219329005,
+      "12": -2122.051671663977
+    },
+    "qhi90_map": {
+      "1": 208.416451291494,
+      "2": -496.4740097756746,
+      "3": 6.029365823855642,
+      "4": 379.8886228016602,
+      "5": -378.3068320198797,
+      "6": 938.0140333306159,
+      "7": 838.4920088235906,
+      "8": 102.21991777341987,
+      "9": -10.189673210724141,
+      "10": 7045.735671906115,
+      "11": 5841.567135445608,
+      "12": -1804.6083471755478
+    },
+    "glo90": -2033.2886182748075,
+    "ghi90": 4747.926395831859,
+    "qlo50_map": {
+      "1": -523.7059489628548,
+      "2": -2200.8532025549916,
+      "3": -1807.5196562873082,
+      "4": -22.55084408629034,
+      "5": -961.6103643433705,
+      "6": -473.6863066646006,
+      "7": -210.47998944226606,
+      "8": -389.95307251117083,
+      "9": -464.32610748386463,
+      "10": 1998.3314806691878,
+      "11": -1223.4372605374797,
+      "12": -1969.4785031607655
+    },
+    "qhi50_map": {
+      "1": 48.70437404704762,
+      "2": -1078.2653573551406,
+      "3": -230.89832295682982,
+      "4": 155.98670758905575,
+      "5": -579.0483313125051,
+      "6": 869.7437645593182,
+      "7": 101.11163739293767,
+      "8": 34.24680355908481,
+      "9": -60.17952542040573,
+      "10": 6233.624636371134,
+      "11": 4196.596728996265,
+      "12": -1886.2678151823995
+    },
+    "glo50": -972.6769341448427,
+    "ghi50": 70.12944740954129
+  },
+  "runtime_versions": {
+    "numpy": "1.26.4",
+    "pandas": "2.2.3",
+    "scipy": "1.13.1",
+    "scikit-learn": "1.5.2",
+    "joblib": "1.4.2",
+    "xgboost": "2.1.4",
+    "python": "3.12.14"
+  },
+  "created_at": "2026-09-24T16:13:10.236405+00:00",
+  "training": {
+    "purpose": "Original benchmark evaluation; production_training describes the deployed estimator",
+    "train_start": 1995,
+    "train_end": 2023,
+    "val_end": 2024,
+    "validation_mode": "chronological",
+    "splits": {
+      "train": {
+        "start": "1995-01-30",
+        "end": "2023-12-31",
+        "rows": 10563
+      },
+      "validation": {
+        "start": "2024-01-01",
+        "end": "2024-12-31",
+        "rows": 366
+      },
+      "test": {
+        "start": "2025-01-01",
+        "end": "2026-08-01",
+        "rows": 578
+      }
+    },
+    "maximum_observed_date": "2026-08-31",
+    "training_target_through": "2024-01-30",
+    "interval_calibration_origin_end": "2024-12-31",
+    "interval_calibration_through": "2025-01-30",
+    "training_script_sha256": "eb2d57197e3cb94eeeda40c1713dae2572e8fcbd587f1465dd7edb449c636162",
+    "inputs": {
+      "data": {
+        "file_name": "ALTU_ALL.csv",
+        "sha256": "294ffe1547ec013bc75352a8c9cdaae5641fadb72f772b11d3ea23477f839913"
+      },
+      "rain": {
+        "file_name": "ERA5Land_daily_area_weighted_subbasin_rainfall.csv",
+        "sha256": "0b2413222949c462d57967d32b4304c5b4a682f3ed29104eaab41bf7137d5e2d"
+      },
+      "soil": {
+        "file_name": "ERA5Land_daily_area_weighted_subbasin_soil_moisture.csv",
+        "sha256": "c0f32e0e8e538f43af68b829dd1cff1e2973960e8ea8266f6ad194c90efa9ea6"
+      }
+    }
+  },
+  "production_training": {
+    "start": "1995-01-30",
+    "end": "2026-08-01",
+    "rows": 11507,
+    "target_through": "2026-08-31",
+    "maximum_observed_date": "2026-08-31",
+    "excluded_recent_unlabeled_rows": 30,
+    "mode": "all_current_labeled_data",
+    "train_start_constraint": 1995,
+    "eligibility": "All retained rows with complete selected features and observed next-30-day targets",
+    "unlabeled_explanation": "The most recent 30 rows lack a complete observed future 30-day target",
+    "hyperparameters": "Cloned unchanged from the selected benchmark RF",
+    "optional_high_qin30_threshold_refit": false
+  },
+  "interval_calibration": {
+    "source": "Original fixed-split benchmark model validation residuals, before production refit",
+    "approximate_for_production": true,
+    "note": "Residual intervals are transferred from the pre-refit benchmark model. Their coverage has not been recalibrated or evaluated for the production model."
+  },
+  "artifact_sha256": "86cb40a7b5be9fa8a114ebbcbbd569519c226c294dccfdb4b8df69bde8959ae8",
+  "verification": {
+    "rows": 11507,
+    "prediction_parity": true,
+    "feature_rows": 11507,
+    "feature_parity": true
+  }
+}

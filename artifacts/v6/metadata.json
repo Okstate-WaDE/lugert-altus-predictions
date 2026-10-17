@@ -1,0 +1,207 @@
+{
+  "schema_version": 1,
+  "model_version": "v6",
+  "best_model_name": "RF_DailyNext30",
+  "feature_columns": [
+    "qin_30d",
+    "doy_sin",
+    "doy_cos",
+    "arain_SB_NW_7d",
+    "arain_SB_SW_30d",
+    "arain_SB_NW_30d",
+    "asm_SB_M_7d",
+    "asm_SB_SE_7d",
+    "asm_SB_SW_30d",
+    "asm_SB_M_30d",
+    "asm_SB_SE_30d",
+    "asm_SB_NW_30d"
+  ],
+  "feature_config": {
+    "feature_columns": [
+      "qin_30d",
+      "doy_sin",
+      "doy_cos",
+      "arain_SB_NW_7d",
+      "arain_SB_SW_30d",
+      "arain_SB_NW_30d",
+      "asm_SB_M_7d",
+      "asm_SB_SE_7d",
+      "asm_SB_SW_30d",
+      "asm_SB_M_30d",
+      "asm_SB_SE_30d",
+      "asm_SB_NW_30d"
+    ],
+    "canonical_subbasins": [
+      {
+        "subbasin_id": "SB_SW",
+        "representative_area_m2": 878470000.0,
+        "reference_lon": -100.2800817,
+        "reference_lat": 35.3272738
+      },
+      {
+        "subbasin_id": "SB_M",
+        "representative_area_m2": 937450000.0,
+        "reference_lon": -99.8063283,
+        "reference_lat": 35.3290272
+      },
+      {
+        "subbasin_id": "SB_SE",
+        "representative_area_m2": 1064410000.0,
+        "reference_lon": -99.5099193,
+        "reference_lat": 35.1724732
+      },
+      {
+        "subbasin_id": "SB_NW",
+        "representative_area_m2": 1405090000.0,
+        "reference_lon": -100.1718715,
+        "reference_lat": 35.4996085
+      }
+    ],
+    "subbasin_area_tolerance_pct": 2.0,
+    "include_year_feature": false,
+    "year_feature_col": "years_since_train_start",
+    "train_start_year": 1995
+  },
+  "prediction_kind": "log_regressor",
+  "intervals": {
+    "qlo90_map": {
+      "1": -2419.1508815489983,
+      "2": -2575.4400846932194,
+      "3": -2153.458986660447,
+      "4": -839.0206870711072,
+      "5": -1699.5926871663232,
+      "6": -677.6916956938039,
+      "7": -300.378431814541,
+      "8": -350.0993196099108,
+      "9": -329.3828039855391,
+      "10": 554.2293010786484,
+      "11": -2912.510570975141,
+      "12": -3129.9254839852356
+    },
+    "qhi90_map": {
+      "1": 770.7862207291423,
+      "2": -276.96855585528164,
+      "3": -546.7815521307496,
+      "4": -235.52485438742244,
+      "5": -636.124759044854,
+      "6": 1249.9383281347916,
+      "7": 819.2708507707641,
+      "8": 343.0228974296261,
+      "9": 196.88463312614329,
+      "10": 6921.295491122755,
+      "11": 6069.92744243187,
+      "12": -1979.1182796145854
+    },
+    "glo90": -2397.61196372059,
+    "ghi90": 4674.990785014869,
+    "qlo50_map": {
+      "1": -1331.1006632035756,
+      "2": -2186.9691025576776,
+      "3": -1783.0358785569326,
+      "4": -754.7988165503215,
+      "5": -1434.7071271705943,
+      "6": -233.77156715575086,
+      "7": 158.7343287879375,
+      "8": -114.78848901720106,
+      "9": -270.7227770636685,
+      "10": 1871.387871083171,
+      "11": -1539.4001975626118,
+      "12": -2444.7538315025627
+    },
+    "qhi50_map": {
+      "1": 586.5384167797205,
+      "2": -1446.4336923004585,
+      "3": -801.9088642595311,
+      "4": -414.46689853298153,
+      "5": -850.0330066997986,
+      "6": 1165.7460867857255,
+      "7": 335.8313635017171,
+      "8": 331.7420301849055,
+      "9": -105.79306246290865,
+      "10": 6091.405370898712,
+      "11": 2193.5603427703613,
+      "12": -2079.71457135393
+    },
+    "glo50": -1447.4836532977852,
+    "ghi50": 325.2733144134858
+  },
+  "runtime_versions": {
+    "numpy": "1.26.4",
+    "pandas": "2.2.3",
+    "scipy": "1.13.1",
+    "scikit-learn": "1.5.2",
+    "joblib": "1.4.2",
+    "xgboost": "2.1.4",
+    "python": "3.12.14"
+  },
+  "created_at": "2026-09-24T16:12:00.858731+00:00",
+  "training": {
+    "purpose": "Original benchmark evaluation; production_training describes the deployed estimator",
+    "train_start": null,
+    "train_end": 2023,
+    "val_end": 2024,
+    "validation_mode": "chronological",
+    "splits": {
+      "train": {
+        "start": "1995-01-30",
+        "end": "2023-12-31",
+        "rows": 10563
+      },
+      "validation": {
+        "start": "2024-01-01",
+        "end": "2024-12-31",
+        "rows": 366
+      },
+      "test": {
+        "start": "2025-01-01",
+        "end": "2026-08-01",
+        "rows": 578
+      }
+    },
+    "maximum_observed_date": "2026-08-31",
+    "training_target_through": "2024-01-30",
+    "interval_calibration_origin_end": "2024-12-31",
+    "interval_calibration_through": "2025-01-30",
+    "training_script_sha256": "682b392c398e4501c27efdd99e5e4262607b29b3d6a18dff404a22abb4d9057b",
+    "inputs": {
+      "data": {
+        "file_name": "ALTU_ALL.csv",
+        "sha256": "294ffe1547ec013bc75352a8c9cdaae5641fadb72f772b11d3ea23477f839913"
+      },
+      "rain": {
+        "file_name": "ERA5Land_daily_area_weighted_subbasin_rainfall.csv",
+        "sha256": "0b2413222949c462d57967d32b4304c5b4a682f3ed29104eaab41bf7137d5e2d"
+      },
+      "soil": {
+        "file_name": "ERA5Land_daily_area_weighted_subbasin_soil_moisture.csv",
+        "sha256": "c0f32e0e8e538f43af68b829dd1cff1e2973960e8ea8266f6ad194c90efa9ea6"
+      }
+    }
+  },
+  "production_training": {
+    "start": "1995-01-30",
+    "end": "2026-08-01",
+    "rows": 11507,
+    "target_through": "2026-08-31",
+    "maximum_observed_date": "2026-08-31",
+    "excluded_recent_unlabeled_rows": 30,
+    "mode": "all_current_labeled_data",
+    "train_start_constraint": null,
+    "eligibility": "All retained rows with complete selected features and observed next-30-day targets",
+    "unlabeled_explanation": "The most recent 30 rows lack a complete observed future 30-day target",
+    "hyperparameters": "Cloned unchanged from the selected benchmark RF",
+    "optional_high_qin30_threshold_refit": false
+  },
+  "interval_calibration": {
+    "source": "Original fixed-split benchmark model validation residuals, before production refit",
+    "approximate_for_production": true,
+    "note": "Residual intervals are transferred from the pre-refit benchmark model. Their coverage has not been recalibrated or evaluated for the production model."
+  },
+  "artifact_sha256": "7ee7c85d3833a35a8bdbf040a7e4be39e051a1a3413036f485bff056df0f6796",
+  "verification": {
+    "rows": 11507,
+    "prediction_parity": true,
+    "feature_rows": 11507,
+    "feature_parity": true
+  }
+}
